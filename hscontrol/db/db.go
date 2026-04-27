@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/glebarez/sqlite"
@@ -797,6 +798,11 @@ WHERE tags IS NOT NULL AND tags != '[]' AND tags != '';
 		}
 	}
 
+	// Headscale-Admin-Pro: 确保自定义表和字段存在
+	if err := ensureAdminProSchema(dbConn); err != nil {
+		return nil, fmt.Errorf("ensuring admin-pro schema: %w", err)
+	}
+
 	// Validate that the schema ends up in the expected state.
 	// This is currently only done on sqlite as squibble does not
 	// support Postgres and we use our sqlite schema as our source of
@@ -824,6 +830,15 @@ WHERE tags IS NOT NULL AND tags != '[]' AND tags != '';
 				// https://litestream.io/how-it-works
 				"_litestream_lock",
 				"_litestream_seq",
+				// Headscale-Admin-Pro: 忽略历史迁移残留表
+				"alembic_version",
+				"users_old",
+				"pre_auth_keys_old",
+				"api_keys_old",
+				"nodes_old",
+				"policies_old",
+				"acl_old",
+				"log_old",
 			},
 		}
 
@@ -1069,6 +1084,81 @@ func runMigrations(cfg types.DatabaseConfig, dbConn *gorm.DB, migrations *gormig
 	}
 
 	return nil
+}
+
+// ensureAdminProSchema ensures the Headscale-Admin-Pro custom tables
+// (acl, log) and extra columns on the users table exist in the database.
+// This runs after GORM migrations but before squibble schema validation.
+func ensureAdminProSchema(dbConn *gorm.DB) error {
+	log.Info().Msg("Ensuring Headscale-Admin-Pro custom schema...")
+
+	// Add extra columns to users table (idempotent via IF NOT EXISTS-style handling)
+	userColumns := []string{
+		"password text",
+		"expire datetime",
+		"cellphone text",
+		"role text",
+		"enable text",
+		"route text",
+		"node text",
+	}
+	for _, col := range userColumns {
+		// SQLite does not support ADD COLUMN IF NOT EXISTS,
+		// so we catch "duplicate column" errors and continue
+		sql := "ALTER TABLE users ADD COLUMN " + col
+		if err := dbConn.Exec(sql).Error; err != nil {
+			// Ignore "duplicate column name" errors
+			if !isDuplicateColumnError(err) {
+				log.Warn().Err(err).Str("column", col).Msg("Failed to add users column (non-fatal)")
+			}
+		}
+	}
+
+	// Create acl and log tables if they don't exist
+	createTables := []string{
+		`CREATE TABLE IF NOT EXISTS acl (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			acl TEXT,
+			user_id INTEGER,
+			CONSTRAINT fk_acl_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS log (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER,
+			content TEXT,
+			created_at DATETIME,
+			CONSTRAINT fk_log_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+	}
+	for _, sql := range createTables {
+		if err := dbConn.Exec(sql).Error; err != nil {
+			log.Warn().Err(err).Msg("Failed to create admin-pro table (non-fatal)")
+		}
+	}
+
+	// Create indexes for the new tables
+	createIndexes := []string{
+		"CREATE INDEX IF NOT EXISTS idx_acl_user_id ON acl(user_id)",
+		"CREATE INDEX IF NOT EXISTS idx_log_user_id ON log(user_id)",
+	}
+	for _, sql := range createIndexes {
+		if err := dbConn.Exec(sql).Error; err != nil {
+			log.Warn().Err(err).Msg("Failed to create admin-pro index (non-fatal)")
+		}
+	}
+
+	log.Info().Msg("Headscale-Admin-Pro custom schema ensured")
+	return nil
+}
+
+// isDuplicateColumnError checks if the SQLite error is "duplicate column name".
+func isDuplicateColumnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "duplicate column name") ||
+		strings.Contains(errStr, "already exists")
 }
 
 func (hsdb *HSDatabase) PingDB(ctx context.Context) error {
