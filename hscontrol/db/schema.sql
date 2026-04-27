@@ -15,7 +15,16 @@ CREATE TABLE users(
 
   created_at datetime,
   updated_at datetime,
-  deleted_at datetime
+  deleted_at datetime,
+
+  -- Headscale-Admin-Pro 自定义字段
+  password text,
+  expire datetime,
+  cellphone text,
+  role text,
+  enable text,
+  route text,
+  node text
 );
 CREATE INDEX idx_users_deleted_at ON users(deleted_at);
 
@@ -104,3 +113,22 @@ CREATE TABLE policies(
   deleted_at datetime
 );
 CREATE INDEX idx_policies_deleted_at ON policies(deleted_at);
+
+-- ================== Headscale-Admin-Pro 自定义表 ==================
+CREATE TABLE acl(
+  id integer PRIMARY KEY AUTOINCREMENT,
+  acl text,
+  user_id integer,
+  CONSTRAINT fk_acl_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_acl_user_id ON acl(user_id);
+
+CREATE TABLE log(
+  id integer PRIMARY KEY AUTOINCREMENT,
+  user_id integer,
+  content text,
+  created_at datetime,
+  CONSTRAINT fk_log_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_log_user_id ON log(user_id);
+-- ================== 自定义表结束 ==================
