@@ -1,184 +1,206 @@
-![headscale logo](./docs/assets/logo/headscale3_header_stacked_left.png)
+[中文](#中文) | [English](#english)
 
-![ci](https://github.com/juanfont/headscale/actions/workflows/test.yml/badge.svg)
+---
 
-An open source, self-hosted implementation of the Tailscale control server.
+![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go&logoColor=white)
+![Headscale Base](https://img.shields.io/badge/Headscale_Base-v0.28.0-326CE5?style=flat-square)
+![License](https://img.shields.io/badge/License-BSD_3--Clause-green?style=flat-square)
+![DB](https://img.shields.io/badge/Database-SQLite_%7C_PostgreSQL-4169E1?style=flat-square)
 
-Join our [Discord server](https://discord.gg/c84AZQhmpx) for a chat.
+---
 
-**Note:** Always select the same GitHub tag as the released version you use
-to ensure you have the correct example configuration. The `main` branch might
-contain unreleased changes. The documentation is available for stable and
-development versions:
+# 中文
 
-- [Documentation for the stable version](https://headscale.net/stable/)
-- [Documentation for the development version](https://headscale.net/development/)
+## Headscale-Admin-AE
 
-## What is Tailscale
+> 基于 headscale v0.28.0 的增强分支，为 Web 管理面板扩展了用户认证与权限字段。
 
-Tailscale is [a modern VPN](https://tailscale.com/) built on top of
-[Wireguard](https://www.wireguard.com/).
-It [works like an overlay network](https://tailscale.com/blog/how-tailscale-works/)
-between the computers of your networks - using
-[NAT traversal](https://tailscale.com/blog/how-nat-traversal-works/).
+Headscale-Admin-AE 是对官方 [headscale](https://github.com/juanfont/headscale) 控制服务器的定制修改版本（基于 v0.28.0），由 **runyf**（[Headscale-Admin-Pro](https://github.com/arounyf/Headscale-Admin-Pro) 原作者）完成核心改造。其目标是让 headscale 与 Web 管理面板能够**共享同一个数据库**，无需额外维护独立的用户系统。
 
-Everything in Tailscale is Open Source, except the GUI clients for proprietary OS
-(Windows and macOS/iOS), and the control server.
+## 为什么需要这个分支
 
-The control server works as an exchange point of Wireguard public keys for the
-nodes in the Tailscale network. It assigns the IP addresses of the clients,
-creates the boundaries between each user, enables sharing machines between users,
-and exposes the advertised routes of your nodes.
+官方 headscale 的 `users` 表仅包含基础字段，没有密码、角色、到期时间等认证信息。Web 管理面板需要这些字段来实现用户登录和权限控制。
 
-A [Tailscale network (tailnet)](https://tailscale.com/docs/concepts/tailnet) is
-private network which Tailscale assigns to a user in terms of private users or an
-organisation.
+常见的做法是让管理面板维护一套独立的用户数据库，但这会带来数据同步问题。本分支选择**直接扩展 headscale 自身的 `users` 表**，使两者共用同一份数据，架构更简洁，维护成本更低。
 
-## Design goal
+## 核心修改
 
-Headscale aims to implement a self-hosted, open source alternative to the
-[Tailscale](https://tailscale.com/) control server. Headscale's goal is to
-provide self-hosters and hobbyists with an open-source server they can use for
-their projects and labs. It implements a narrow scope, a _single_ Tailscale
-network (tailnet), suitable for a personal use, or a small open-source
-organisation.
+### 1. 扩展 `users` 表结构
 
-## Supporting Headscale
+在官方 `users` 表基础上新增以下字段：
 
-If you like `headscale` and find it useful, there is a sponsorship and donation
-buttons available in the repo.
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `password` | TEXT | 用户登录密码（哈希存储） |
+| `role` | TEXT | 用户角色（如 admin / user） |
+| `expire` | DATETIME | 账户过期时间 |
+| `enable` | BOOLEAN | 账户启用/禁用开关 |
+| `node` | INTEGER | 节点配额限制 |
+| `route` | TEXT | 路由权限控制 |
 
-## Features
+### 2. ACL 策略数据库模式
 
-Please see ["Features" in the documentation](https://headscale.net/stable/about/features/).
+支持 `policy.mode: database` 配置项，将 ACL 规则存储在 `policies` 表（`data` TEXT 字段）中，不再强制依赖文件模式。
 
-## Client OS support
+### 3. 数据库兼容性调整
 
-Please see ["Client and operating system support" in the documentation](https://headscale.net/stable/about/clients/).
+针对管理面板的数据库访问需求进行了兼容性适配，确保 headscale 与管理面板能稳定地共享同一个 SQLite 或 PostgreSQL 数据库。
 
-## Running headscale
+### 4. 完全 CLI 兼容
 
-**Please note that we do not support nor encourage the use of reverse proxies
-and container to run Headscale.**
+编译产物仍为 `headscale` 二进制文件，所有命令行参数和用法与官方版本保持一致。
 
-Please have a look at the [`documentation`](https://headscale.net/stable/).
+## 版本兼容性
 
-For NixOS users, a module is available in [`nix/`](./nix/).
+| AE 版本 | headscale 基础版本 | 兼容管理面板 |
+|---------|-------------------|-------------|
+| v0.28.0-ae | v0.28.0 | [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) |
 
-## Builds from `main`
+## 安装
 
-Development builds from the `main` branch are available as container images and
-binaries. See the [development builds](https://headscale.net/stable/setup/install/main/)
-documentation for details.
+### 从源码构建
 
-## Talks
-
-- Fosdem 2026 (video): [Headscale & Tailscale: The complementary open source clone](https://fosdem.org/2026/schedule/event/KYQ3LL-headscale-the-complementary-open-source-clone/)
-  - presented by Kristoffer Dalby
-- Fosdem 2023 (video): [Headscale: How we are using integration testing to reimplement Tailscale](https://fosdem.org/2023/schedule/event/goheadscale/)
-  - presented by Juan Font Alonso and Kristoffer Dalby
-
-## Disclaimer
-
-This project is not associated with Tailscale Inc.
-
-However, one of the active maintainers for Headscale [is employed by Tailscale](https://tailscale.com/blog/opensource) and he is allowed to spend work hours contributing to the project. Contributions from this maintainer are reviewed by other maintainers.
-
-The maintainers work together on setting the direction for the project. The underlying principle is to serve the community of self-hosters, enthusiasts and hobbyists - while having a sustainable project.
-
-## Contributing
-
-Please read the [CONTRIBUTING.md](./CONTRIBUTING.md) file.
-
-### Requirements
-
-To contribute to headscale you would need the latest version of [Go](https://golang.org)
-and [Buf](https://buf.build) (Protobuf generator).
-
-We recommend using [Nix](https://nixos.org/) to setup a development environment. This can
-be done with `nix develop`, which will install the tools and give you a shell.
-This guarantees that you will have the same dev env as `headscale` maintainers.
-
-### Code style
-
-To ensure we have some consistency with a growing number of contributions,
-this project has adopted linting and style/formatting rules:
-
-The **Go** code is linted with [`golangci-lint`](https://golangci-lint.run) and
-formatted with [`golines`](https://github.com/segmentio/golines) (width 88) and
-[`gofumpt`](https://github.com/mvdan/gofumpt).
-Please configure your editor to run the tools while developing and make sure to
-run `make lint` and `make fmt` before committing any code.
-
-The **Proto** code is linted with [`buf`](https://docs.buf.build/lint/overview) and
-formatted with [`clang-format`](https://clang.llvm.org/docs/ClangFormat.html).
-
-The **docs** are formatted with [`mdformat`](https://mdformat.readthedocs.io).
-
-The **rest** (Markdown, YAML, etc) is formatted with [`prettier`](https://prettier.io).
-
-Check out the `.golangci.yaml` and `Makefile` to see the specific configuration.
-
-### Install development tools
-
-- Go
-- Buf
-- Protobuf tools
-
-Install and activate:
-
-```shell
-nix develop
+```bash
+git clone https://github.com/chen1749144759/Headscale-Admin-AE.git
+cd Headscale-Admin-AE
+go build -o headscale ./cmd/headscale
 ```
 
-### Testing and building
+### 使用方式
 
-Some parts of the project require the generation of Go code from Protobuf
-(if changes are made in `proto/`) and it must be (re-)generated with:
+编译后的 `headscale` 二进制文件可直接替换官方版本，配置文件格式完全兼容：
 
-```shell
-make generate
+```bash
+# 与官方 headscale 用法一致
+./headscale serve
+./headscale users list
+./headscale nodes list
 ```
 
-**Note**: Please check in changes from `gen/` in a separate commit to make it easier to review.
+## 配置
 
-To run the tests:
+在标准 headscale 配置文件基础上，可启用数据库策略模式：
 
-```shell
-make test
+```yaml
+policy:
+  mode: database   # 使用数据库存储 ACL 规则（默认为 file）
 ```
 
-To build the program:
+其余配置项与官方 headscale v0.28.0 完全一致，请参阅 [官方文档](https://headscale.net/stable/)。
 
-```shell
-make build
+## 相关项目
+
+| 项目 | 说明 |
+|------|------|
+| [headscale](https://github.com/juanfont/headscale) | 官方 headscale 开源控制服务器 |
+| [Headscale-Admin-Pro](https://github.com/arounyf/Headscale-Admin-Pro) | 原始管理面板（runyf 开发） |
+| [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) | 配套 Web 管理面板 |
+
+## 致谢
+
+- [juanfont/headscale](https://github.com/juanfont/headscale) — 优秀的开源 Tailscale 控制服务器
+- [arounyf](https://github.com/arounyf) (runyf) — headscale 数据库扩展改造的原始作者
+- [Tailscale](https://tailscale.com/) — 现代化的 WireGuard 组网方案
+
+## 许可证
+
+本项目基于 [BSD 3-Clause License](LICENSE) 开源，与 headscale 保持一致。
+
+---
+
+# English
+
+## Headscale-Admin-AE
+
+> An enhanced fork of headscale v0.28.0 with extended user authentication and permission fields for web admin panel integration.
+
+Headscale-Admin-AE is a modified version of the official [headscale](https://github.com/juanfont/headscale) control server (based on v0.28.0), with core modifications by **runyf** (original author of [Headscale-Admin-Pro](https://github.com/arounyf/Headscale-Admin-Pro)). It enables headscale and a web admin panel to **share a single database**, eliminating the need for a separate user management system.
+
+## Why This Fork
+
+The official headscale `users` table only contains basic fields — no password, role, or expiration data. A web admin panel requires these fields to provide user login and access control.
+
+A common approach is to maintain a separate user database for the admin panel, but this introduces data synchronization issues. This fork takes a different approach: **extend headscale's own `users` table directly**, so both systems share one data source. Simpler architecture, lower maintenance overhead.
+
+## Key Modifications
+
+### 1. Extended `users` Table
+
+The following columns are added to the official `users` table:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `password` | TEXT | User login password (hashed) |
+| `role` | TEXT | User role (e.g., admin / user) |
+| `expire` | DATETIME | Account expiration time |
+| `enable` | BOOLEAN | Account enabled/disabled flag |
+| `node` | INTEGER | Node quota limit |
+| `route` | TEXT | Route permission control |
+
+### 2. ACL Policy Database Mode
+
+Supports `policy.mode: database` configuration, storing ACL rules in a `policies` table (`data` TEXT field) instead of requiring file-based policy management.
+
+### 3. Database Compatibility
+
+Includes compatibility adjustments so that headscale and the admin panel can reliably share the same SQLite or PostgreSQL database.
+
+### 4. Full CLI Compatibility
+
+The compiled binary is still named `headscale`. All command-line arguments and usage remain identical to the official version.
+
+## Version Compatibility
+
+| AE Version | Headscale Base | Compatible Admin Panel |
+|-------------|---------------|----------------------|
+| v0.28.0-ae | v0.28.0 | [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) |
+
+## Installation
+
+### Build from Source
+
+```bash
+git clone https://github.com/chen1749144759/Headscale-Admin-AE.git
+cd Headscale-Admin-AE
+go build -o headscale ./cmd/headscale
 ```
 
-### Development workflow
+### Usage
 
-We recommend using Nix for dependency management to ensure you have all required tools. If you prefer to manage dependencies yourself, you can use Make directly:
+The compiled `headscale` binary is a drop-in replacement for the official version. Configuration file format is fully compatible:
 
-**With Nix (recommended):**
-
-```shell
-nix develop
-make test
-make build
+```bash
+# Same usage as official headscale
+./headscale serve
+./headscale users list
+./headscale nodes list
 ```
 
-**With your own dependencies:**
+## Configuration
 
-```shell
-make test
-make build
+On top of the standard headscale configuration, you can enable database policy mode:
+
+```yaml
+policy:
+  mode: database   # Store ACL rules in database (default: file)
 ```
 
-The Makefile will warn you if any required tools are missing and suggest running `nix develop`. Run `make help` to see all available targets.
+All other configuration options are identical to official headscale v0.28.0. Refer to the [official documentation](https://headscale.net/stable/) for details.
 
-## Contributors
+## Related Projects
 
-<a href="https://github.com/juanfont/headscale/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=juanfont/headscale" />
-</a>
+| Project | Description |
+|---------|-------------|
+| [headscale](https://github.com/juanfont/headscale) | Official open-source headscale control server |
+| [Headscale-Admin-Pro](https://github.com/arounyf/Headscale-Admin-Pro) | Original admin panel by runyf |
+| [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) | Companion web admin panel |
 
-Made with [contrib.rocks](https://contrib.rocks).
+## Credits
+
+- [juanfont/headscale](https://github.com/juanfont/headscale) — The excellent open-source Tailscale control server
+- [arounyf](https://github.com/arounyf) (runyf) — Original author of the headscale database extension modifications
+- [Tailscale](https://tailscale.com/) — Modern WireGuard-based networking
+
+## License
+
+This project is licensed under the [BSD 3-Clause License](LICENSE), consistent with headscale.
