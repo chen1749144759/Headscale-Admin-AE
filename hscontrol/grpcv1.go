@@ -522,6 +522,26 @@ func (api headscaleV1APIServer) RenameNode(
 	return &v1.RenameNodeResponse{Node: node.Proto()}, nil
 }
 
+func (api headscaleV1APIServer) MoveNode(
+	ctx context.Context,
+	request *v1.MoveNodeRequest,
+) (*v1.MoveNodeResponse, error) {
+	node, nodeChange, err := api.h.state.MoveNode(types.NodeID(request.GetNodeId()), request.GetUser())
+	if err != nil {
+		return nil, err
+	}
+
+	api.h.Change(nodeChange)
+
+	log.Trace().
+		Caller().
+		EmbedObject(node).
+		Str("new_user", request.GetUser()).
+		Msg("node moved to new user")
+
+	return &v1.MoveNodeResponse{Node: node.Proto()}, nil
+}
+
 func (api headscaleV1APIServer) ListNodes(
 	ctx context.Context,
 	request *v1.ListNodesRequest,

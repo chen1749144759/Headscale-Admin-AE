@@ -50,6 +50,24 @@ Headscale-Admin-AE 是对官方 [headscale](https://github.com/juanfont/headscal
 
 编译产物仍为 `headscale` 二进制文件，所有命令行参数和用法与官方版本保持一致。
 
+### 5. 新增 MoveNode API
+
+新增 `MoveNode` gRPC/REST 接口，支持将节点在不同用户（分组）之间迁移，**无需重启 Headscale 服务**。变更直接更新内存中的 NodeStore 快照和数据库，并自动通知所有在线节点刷新网络映射。
+
+- **REST 端点**：`POST /api/v1/node/{node_id}/user`
+- **请求体**：`{"user": "目标用户名"}`
+- **响应**：返回迁移后的完整 Node 对象
+
+涉及修改的文件：
+
+| 文件 | 变更说明 |
+|------|---------|
+| `proto/headscale/v1/node.proto` | 新增 `MoveNodeRequest` / `MoveNodeResponse` 消息定义 |
+| `proto/headscale/v1/headscale.proto` | 新增 `rpc MoveNode` 服务定义及 HTTP 路由映射 |
+| `gen/go/headscale/v1/*.go` | 由 `buf generate` 自动生成的 gRPC/gateway 代码 |
+| `hscontrol/state/state.go` | 新增 `State.MoveNode()` 方法，通过 `NodeStore.UpdateNode` 热更新内存 |
+| `hscontrol/grpcv1.go` | 新增 `MoveNode` gRPC handler |
+
 ## 版本兼容性
 
 | AE 版本 | headscale 基础版本 | 兼容管理面板 |
@@ -148,6 +166,24 @@ Includes compatibility adjustments so that headscale and the admin panel can rel
 ### 4. Full CLI Compatibility
 
 The compiled binary is still named `headscale`. All command-line arguments and usage remain identical to the official version.
+
+### 5. New MoveNode API
+
+A new `MoveNode` gRPC/REST endpoint that allows moving nodes between users (groups) **without restarting the Headscale service**. Changes are applied directly to the in-memory NodeStore snapshot and the database, and all connected nodes are automatically notified to refresh their network maps.
+
+- **REST endpoint**: `POST /api/v1/node/{node_id}/user`
+- **Request body**: `{"user": "target_username"}`
+- **Response**: Returns the complete Node object after migration
+
+Modified files:
+
+| File | Description |
+|------|-------------|
+| `proto/headscale/v1/node.proto` | Added `MoveNodeRequest` / `MoveNodeResponse` message definitions |
+| `proto/headscale/v1/headscale.proto` | Added `rpc MoveNode` service definition with HTTP route mapping |
+| `gen/go/headscale/v1/*.go` | Auto-generated gRPC/gateway code via `buf generate` |
+| `hscontrol/state/state.go` | Added `State.MoveNode()` method with hot-update via `NodeStore.UpdateNode` |
+| `hscontrol/grpcv1.go` | Added `MoveNode` gRPC handler |
 
 ## Version Compatibility
 

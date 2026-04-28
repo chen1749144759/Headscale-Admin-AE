@@ -135,6 +135,15 @@ message DebugCreateNodeResponse {
   Node node = 1;
 }
 
+message MoveNodeRequest {
+  uint64 node_id = 1;
+  string user = 2;
+}
+
+message MoveNodeResponse {
+  Node node = 1;
+}
+
 message BackfillNodeIPsRequest {
   bool confirmed = 1;
 }

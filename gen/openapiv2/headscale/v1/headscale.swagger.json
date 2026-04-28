@@ -607,6 +607,45 @@
         ]
       }
     },
+    "/api/v1/node/{nodeId}/user": {
+      "post": {
+        "operationId": "HeadscaleService_MoveNode",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1MoveNodeResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "nodeId",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "format": "uint64"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/HeadscaleServiceMoveNodeBody"
+            }
+          }
+        ],
+        "tags": [
+          "HeadscaleService"
+        ]
+      }
+    },
     "/api/v1/policy": {
       "get": {
         "summary": "--- Policy start ---",
@@ -918,6 +957,14 @@
     }
   },
   "definitions": {
+    "HeadscaleServiceMoveNodeBody": {
+      "type": "object",
+      "properties": {
+        "user": {
+          "type": "string"
+        }
+      }
+    },
     "HeadscaleServiceSetApprovedRoutesBody": {
       "type": "object",
       "properties": {
@@ -1267,6 +1314,14 @@
             "type": "object",
             "$ref": "#/definitions/v1User"
           }
+        }
+      }
+    },
+    "v1MoveNodeResponse": {
+      "type": "object",
+      "properties": {
+        "node": {
+          "$ref": "#/definitions/v1Node"
         }
       }
     },

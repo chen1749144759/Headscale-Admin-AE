@@ -979,6 +979,47 @@ func (s *State) SetApprovedRoutes(nodeID types.NodeID, routes []netip.Prefix) (t
 	return nodeView, c, nil
 }
 
+// MoveNode transfers a node to a different user (group). This updates the node's
+// ownership in both the in-memory NodeStore and the database, then notifies all
+// connected peers so they receive updated network maps.
+// If the node was previously tagged, tags are cleared since tagged and user-owned
+// states are mutually exclusive.
+func (s *State) MoveNode(nodeID types.NodeID, newUserName string) (types.NodeView, change.Change, error) {
+	// Look up the target user by name
+	user, err := s.db.GetUserByName(newUserName)
+	if err != nil {
+		return types.NodeView{}, change.Change{}, fmt.Errorf("looking up user %q: %w", newUserName, err)
+	}
+
+	// Verify node exists
+	_, exists := s.nodeStore.GetNode(nodeID)
+	if !exists {
+		return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %d", ErrNodeNotFound, nodeID)
+	}
+
+	// Update NodeStore: change ownership to the new user.
+	// Clear tags because tagged and user-owned are mutually exclusive.
+	n, ok := s.nodeStore.UpdateNode(nodeID, func(node *types.Node) {
+		node.UserID = &user.ID
+		node.User = user
+		node.Tags = nil
+	})
+
+	if !ok {
+		return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, nodeID)
+	}
+
+	nodeView, c, err := s.persistNodeToDB(n)
+	if err != nil {
+		return types.NodeView{}, change.Change{}, err
+	}
+
+	// Set OriginNode so the mapper includes self-update for this node.
+	c.OriginNode = nodeID
+
+	return nodeView, c, nil
+}
+
 // RenameNode changes the display name of a node. The admin supplies
 // the exact DNS label they want; malformed input is rejected (no
 // auto-sanitisation) and collisions error out rather than silently
