@@ -1,10 +1,14 @@
 # ====== 第一阶段：编译 ======
 FROM golang:1-bookworm AS builder
 
+ARG VERSION=dev
+
 WORKDIR /src
 COPY . .
 
-RUN go build -trimpath -ldflags="-s -w" -o /out/headscale ./cmd/headscale
+RUN go build -trimpath \
+    -ldflags="-s -w -X github.com/juanfont/headscale/hscontrol/types.Version=${VERSION}" \
+    -o /out/headscale ./cmd/headscale
 
 # ====== 第二阶段：运行 ======
 FROM debian:bookworm-slim
