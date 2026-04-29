@@ -38,6 +38,11 @@ func (v *VersionInfo) String() string {
 	return sb.String()
 }
 
+// Version can be injected at build time via:
+//
+//	go build -ldflags="-X github.com/juanfont/headscale/hscontrol/types.Version=v4.1.0"
+var Version string
+
 var buildInfo = sync.OnceValues(debug.ReadBuildInfo)
 
 var GetVersionInfo = sync.OnceValue(func() *VersionInfo {
@@ -58,8 +63,10 @@ var GetVersionInfo = sync.OnceValue(func() *VersionInfo {
 		return info
 	}
 
-	// Extract version from module path or main version
-	if buildInfo.Main.Version != "" && buildInfo.Main.Version != "(devel)" {
+	// Prefer injected version, then module version
+	if Version != "" {
+		info.Version = Version
+	} else if buildInfo.Main.Version != "" && buildInfo.Main.Version != "(devel)" {
 		info.Version = buildInfo.Main.Version
 	}
 
