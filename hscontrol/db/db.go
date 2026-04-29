@@ -1092,43 +1092,74 @@ func runMigrations(cfg types.DatabaseConfig, dbConn *gorm.DB, migrations *gormig
 func ensureAdminProSchema(dbConn *gorm.DB) error {
 	log.Info().Msg("Ensuring Headscale-Admin-Pro custom schema...")
 
+	isPostgres := dbConn.Dialector.Name() == "postgres"
+
 	// Add extra columns to users table (idempotent via IF NOT EXISTS-style handling)
-	userColumns := []string{
-		"password text",
-		"expire datetime",
-		"cellphone text",
-		"role text",
-		"enable text",
-		"route text",
-		"node text",
+	userColumns := []struct {
+		name    string
+		sqlType string
+	}{
+		{"password", "text"},
+		{"expire", "timestamp"},
+		{"cellphone", "text"},
+		{"role", "text"},
+		{"enable", "text"},
+		{"route", "text"},
+		{"node", "text"},
 	}
 	for _, col := range userColumns {
-		// SQLite does not support ADD COLUMN IF NOT EXISTS,
-		// so we catch "duplicate column" errors and continue
-		sql := "ALTER TABLE users ADD COLUMN " + col
+		var sql string
+		if isPostgres {
+			sql = fmt.Sprintf("ALTER TABLE users ADD COLUMN IF NOT EXISTS %s %s", col.name, col.sqlType)
+		} else {
+			// SQLite does not support ADD COLUMN IF NOT EXISTS,
+			// so we catch "duplicate column" errors and continue
+			colType := col.sqlType
+			if colType == "timestamp" {
+				colType = "datetime"
+			}
+			sql = fmt.Sprintf("ALTER TABLE users ADD COLUMN %s %s", col.name, colType)
+		}
 		if err := dbConn.Exec(sql).Error; err != nil {
-			// Ignore "duplicate column name" errors
+			// Ignore "duplicate column name" / "already exists" errors
 			if !isDuplicateColumnError(err) {
-				log.Warn().Err(err).Str("column", col).Msg("Failed to add users column (non-fatal)")
+				log.Warn().Err(err).Str("column", col.name).Msg("Failed to add users column (non-fatal)")
 			}
 		}
 	}
 
 	// Create acl and log tables if they don't exist
-	createTables := []string{
-		`CREATE TABLE IF NOT EXISTS acl (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			acl TEXT,
-			user_id INTEGER,
-			CONSTRAINT fk_acl_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-		)`,
-		`CREATE TABLE IF NOT EXISTS log (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			user_id INTEGER,
-			content TEXT,
-			created_at DATETIME,
-			CONSTRAINT fk_log_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-		)`,
+	var createTables []string
+	if isPostgres {
+		createTables = []string{
+			`CREATE TABLE IF NOT EXISTS acl (
+				id SERIAL PRIMARY KEY,
+				acl TEXT,
+				user_id INTEGER REFERENCES users(id) ON DELETE CASCADE
+			)`,
+			`CREATE TABLE IF NOT EXISTS log (
+				id SERIAL PRIMARY KEY,
+				user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+				content TEXT,
+				created_at TIMESTAMP DEFAULT NOW()
+			)`,
+		}
+	} else {
+		createTables = []string{
+			`CREATE TABLE IF NOT EXISTS acl (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				acl TEXT,
+				user_id INTEGER,
+				CONSTRAINT fk_acl_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+			)`,
+			`CREATE TABLE IF NOT EXISTS log (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				user_id INTEGER,
+				content TEXT,
+				created_at DATETIME,
+				CONSTRAINT fk_log_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+			)`,
+		}
 	}
 	for _, sql := range createTables {
 		if err := dbConn.Exec(sql).Error; err != nil {
