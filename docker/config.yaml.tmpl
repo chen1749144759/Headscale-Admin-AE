@@ -27,9 +27,8 @@ derp:
     private: true
     verify_clients: false
     private_key_path: /var/lib/headscale/derp.key
-  urls:
-    - https://controlplane.tailscale.com/derpmap/default
-  auto_update: false
+  urls: []
+  auto_update_enabled: false
 
 database:
   type: postgres

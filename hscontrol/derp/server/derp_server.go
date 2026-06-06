@@ -119,12 +119,13 @@ func (d *DERPServer) GenerateRegion() (tailcfg.DERPRegion, error) {
 		Avoid:      false,
 		Nodes: []*tailcfg.DERPNode{
 			{
-				Name:     strconv.Itoa(d.cfg.ServerRegionID),
-				RegionID: d.cfg.ServerRegionID,
-				HostName: host,
-				DERPPort: port,
-				IPv4:     d.cfg.IPv4,
-				IPv6:     d.cfg.IPv6,
+				Name:             strconv.Itoa(d.cfg.ServerRegionID),
+				RegionID:         d.cfg.ServerRegionID,
+				HostName:         host,
+				DERPPort:         port,
+				IPv4:             d.cfg.IPv4,
+				IPv6:             d.cfg.IPv6,
+				InsecureForTests: serverURL.Scheme == "http",
 			},
 		},
 	}
