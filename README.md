@@ -2,8 +2,9 @@
 
 ---
 
-![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go&logoColor=white)
+![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go&logoColor=white)
 ![Headscale Base](https://img.shields.io/badge/Headscale_Base-v0.28.0-326CE5?style=flat-square)
+![Headscale Fixes](https://img.shields.io/badge/Headscale_Fixes-v0.29.1_Backports-326CE5?style=flat-square)
 ![License](https://img.shields.io/badge/License-BSD_3--Clause-green?style=flat-square)
 ![DB](https://img.shields.io/badge/Database-SQLite_%7C_PostgreSQL-4169E1?style=flat-square)
 
@@ -16,6 +17,14 @@
 > 基于 headscale v0.28.0 的增强分支，为 Web 管理面板扩展了用户认证与权限字段。
 
 Headscale-Admin-AE 是对官方 [headscale](https://github.com/juanfont/headscale) 控制服务器的定制修改版本（基于 v0.28.0），由 **runyf**（[Headscale-Admin-Pro](https://github.com/arounyf/Headscale-Admin-Pro) 原作者）完成核心改造。其目标是让 headscale 与 Web 管理面板能够**共享同一个数据库**，无需额外维护独立的用户系统。
+
+## 当前对标版本
+
+- 基础分支：官方 headscale `v0.28.0` 的 AE 定制分支。
+- 本轮对标：官方 headscale `v0.29.1` 的注册、重注册、数据库迁移、DERP、OIDC 和 DNS 稳定性修复。
+- 当前不是整仓升级到 headscale `v0.29.1`，仍保留管理面板数据库扩展、数据库策略模式、MoveNode API、内置 DERP 环境变量等本项目能力。
+- Go 版本：`go.mod` 使用 Go `1.26.1`。
+- Tailscale 依赖：当前仍为 `tailscale.com v1.96.5`。客户端 ScaleTail 已按 Tailscale `v1.98.5` 关键修复审计，两端继续通过标准 `tailcfg` 控制协议对接。
 
 ## 为什么需要这个分支
 
@@ -68,11 +77,25 @@ Headscale-Admin-AE 是对官方 [headscale](https://github.com/juanfont/headscal
 | `hscontrol/state/state.go` | 新增 `State.MoveNode()` 方法，通过 `NodeStore.UpdateNode` 热更新内存 |
 | `hscontrol/grpcv1.go` | 新增 `MoveNode` gRPC handler |
 
+### 6. headscale v0.29.1 核心修复回补
+
+本轮没有直接合并官方 `v0.29.1` 整仓代码，而是按本项目业务保留范围做了定向回补：
+
+- 注册与重注册流程增加 MachineKey 级互斥，避免同一客户端并发注册导致重复节点或状态错乱。
+- NodeKey/MachineKey 归属校验更严格，防止 NodeKey 被其他 MachineKey 复用，也能识别同一节点重启后的合法复连。
+- 预认证密钥校验更稳：未知 key 视为不存在，过期节点重注册会重新校验 key，一次性 key 使用原子条件更新，避免重复消费。
+- 同一节点用原 NodeKey 复连时可以复用已有记录；真正更换 key 或重新注册时再走新的校验和更新流程。
+- NodeStore 更新后如果数据库写入失败会回滚内存快照，避免在线状态与数据库不一致。
+- 数据库迁移补齐零值过期时间转 `NULL`、`tags='null'` 用户归属恢复、API key 主键查询等兼容修复。
+- IP 分配补齐 /32、/128 等极小网段保护，随机 IP 生成补齐字节长度，避免异常网段下 panic。
+- DERP map shuffle 前复制 region，避免修改共享结构；OIDC cookie 使用更稳的 SameSite 与短名称；IPv4 /32 反向 DNS 生成逻辑补齐。
+
 ## 版本兼容性
 
-| AE 版本 | headscale 基础版本 | 兼容管理面板 |
-|---------|-------------------|-------------|
-| v0.28.0-ae | v0.28.0 | [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) |
+| AE 版本 | headscale 基础版本 | 对标修复 | Tailscale 依赖 | 兼容管理面板 |
+|---------|-------------------|----------|----------------|-------------|
+| v0.28.0-ae | v0.28.0 | AE 基础改造 | v1.96.5 | [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) |
+| 当前 main | v0.28.0 AE 分支 | headscale v0.29.1 核心稳定性修复回补 | v1.96.5 | [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) |
 
 ## 安装
 
@@ -134,6 +157,14 @@ policy:
 
 Headscale-Admin-AE is a modified version of the official [headscale](https://github.com/juanfont/headscale) control server (based on v0.28.0), with core modifications by **runyf** (original author of [Headscale-Admin-Pro](https://github.com/arounyf/Headscale-Admin-Pro)). It enables headscale and a web admin panel to **share a single database**, eliminating the need for a separate user management system.
 
+## Current Upstream Targets
+
+- Base branch: the AE customized branch based on official headscale `v0.28.0`.
+- Current backport target: key registration, re-registration, database migration, DERP, OIDC, and DNS stability fixes from official headscale `v0.29.1`.
+- This is not a full repository upgrade to headscale `v0.29.1`; the project keeps its admin-panel database extensions, database policy mode, MoveNode API, embedded DERP environment overrides, and other AE-specific behavior.
+- Go version: `go.mod` uses Go `1.26.1`.
+- Tailscale dependency: still `tailscale.com v1.96.5`. The ScaleTail client has been audited against key Tailscale `v1.98.5` fixes, and both sides continue to communicate through the standard `tailcfg` control protocol.
+
 ## Why This Fork
 
 The official headscale `users` table only contains basic fields — no password, role, or expiration data. A web admin panel requires these fields to provide user login and access control.
@@ -185,11 +216,25 @@ Modified files:
 | `hscontrol/state/state.go` | Added `State.MoveNode()` method with hot-update via `NodeStore.UpdateNode` |
 | `hscontrol/grpcv1.go` | Added `MoveNode` gRPC handler |
 
+### 6. headscale v0.29.1 Stability Backports
+
+This round does not merge the entire official `v0.29.1` tree. Instead, it selectively backports the fixes that matter to this fork:
+
+- Registration and re-registration now use a MachineKey-level lock to avoid duplicate nodes or inconsistent state during concurrent registration.
+- NodeKey/MachineKey ownership checks are stricter, preventing NodeKey reuse by another MachineKey while still allowing valid restarts from the same node.
+- Pre-auth key validation is safer: unknown keys are treated as missing, expired-node re-registration revalidates the key, and one-time key consumption uses an atomic conditional update.
+- A same-node reconnect with the existing NodeKey can reuse the existing record; real key changes or re-registration paths still go through validation and update.
+- NodeStore changes are rolled back if the database write fails, avoiding divergence between in-memory state and persistent state.
+- Database migrations include zero expiry to `NULL`, `tags='null'` user ownership recovery, and explicit API key primary-key lookup fixes.
+- IP allocation now handles tiny /32 and /128 prefixes and pads random IP bytes correctly to avoid panics on unusual prefixes.
+- DERP region shuffle now works on cloned regions, OIDC cookies use safer SameSite and shorter names, and IPv4 /32 reverse-DNS generation is fixed.
+
 ## Version Compatibility
 
-| AE Version | Headscale Base | Compatible Admin Panel |
-|-------------|---------------|----------------------|
-| v0.28.0-ae | v0.28.0 | [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) |
+| AE Version | Headscale Base | Backported Fixes | Tailscale Dependency | Compatible Admin Panel |
+|-------------|---------------|------------------|----------------------|------------------------|
+| v0.28.0-ae | v0.28.0 | AE baseline changes | v1.96.5 | [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) |
+| current main | v0.28.0 AE branch | headscale v0.29.1 core stability fixes | v1.96.5 | [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) |
 
 ## Installation
 
