@@ -109,7 +109,7 @@ func (hsdb *HSDatabase) GetAPIKey(prefix string) (*types.APIKey, error) {
 // GetAPIKeyByID returns a ApiKey for a given id.
 func (hsdb *HSDatabase) GetAPIKeyByID(id uint64) (*types.APIKey, error) {
 	key := types.APIKey{}
-	if result := hsdb.DB.Find(&types.APIKey{ID: id}).First(&key); result.Error != nil {
+	if result := hsdb.DB.First(&key, "id = ?", id); result.Error != nil {
 		return nil, result.Error
 	}
 

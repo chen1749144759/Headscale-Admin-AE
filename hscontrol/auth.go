@@ -85,8 +85,7 @@ func (h *Headscale) handleRegister(
 
 			// When tailscaled restarts, it sends RegisterRequest with Auth=nil and Expiry=zero.
 			// Return the current node state without modification.
-			// See: https://github.com/juanfont/headscale/issues/2862
-			if req.Expiry.IsZero() && node.Expiry().Valid() && !node.IsExpired() {
+			if req.Expiry.IsZero() && !node.IsExpired() {
 				return nodeToRegisterResponse(node), nil
 			}
 
@@ -227,6 +226,9 @@ func (h *Headscale) handleLogout(
 	// Update the internal state with the nodes new expiry, meaning it is
 	// logged out.
 	expiry := req.Expiry
+	if now := time.Now(); expiry.Before(now) {
+		expiry = now
+	}
 
 	updatedNode, c, err := h.state.SetNodeExpiry(node.ID(), &expiry)
 	if err != nil {

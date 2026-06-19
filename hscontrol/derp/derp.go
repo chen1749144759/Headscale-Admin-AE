@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"hash/crc64"
 	"io"
-	"maps"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -85,7 +84,12 @@ func mergeDERPMaps(derpMaps []*tailcfg.DERPMap) *tailcfg.DERPMap {
 	}
 
 	for _, derpMap := range derpMaps {
-		maps.Copy(result.Regions, derpMap.Regions)
+		// Clone regions before shuffling below. The configured DERP map can be
+		// reused by callers, and mutating shared region pointers can race with
+		// readers that already received the previous map.
+		for id, region := range derpMap.Regions {
+			result.Regions[id] = region.Clone()
+		}
 	}
 
 	for id, region := range result.Regions {

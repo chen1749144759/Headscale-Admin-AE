@@ -918,11 +918,12 @@ func renderAuthSuccessTemplate(
 }
 
 // getCookieName generates a unique cookie name based on a cookie value.
-// Callers must ensure value has at least cookieNamePrefixLen bytes;
-// extractCodeAndStateParamFromRequest enforces this for the state
-// parameter, and setCSRFCookie always supplies a 64-byte random value.
+// It uses at most cookieNamePrefixLen bytes so malformed short values do not
+// panic while looking up nonce/state cookies.
 func getCookieName(baseName, value string) string {
-	return fmt.Sprintf("%s_%s", baseName, value[:cookieNamePrefixLen])
+	n := min(len(value), cookieNamePrefixLen)
+
+	return fmt.Sprintf("%s_%s", baseName, value[:n])
 }
 
 func setCSRFCookie(w http.ResponseWriter, r *http.Request, name string) (string, error) {
@@ -938,6 +939,10 @@ func setCSRFCookie(w http.ResponseWriter, r *http.Request, name string) (string,
 		MaxAge:   int(time.Hour.Seconds()),
 		Secure:   r.TLS != nil,
 		HttpOnly: true,
+		// OIDC callbacks are top-level cross-site redirects. Strict cookies can
+		// be dropped by browsers and break login, while Lax still blocks most
+		// cross-site subresource requests.
+		SameSite: http.SameSiteLaxMode,
 	}
 	http.SetCookie(w, c)
 

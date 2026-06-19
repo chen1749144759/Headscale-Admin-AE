@@ -650,27 +650,53 @@ func (s *NodeStore) GetNodeByMachineKey(machineKey key.MachinePublic, userID typ
 	return types.NodeView{}, false
 }
 
-// GetNodeByMachineKeyAnyUser returns the first node with the given machine key,
-// regardless of which user it belongs to. This is useful for scenarios like
-// transferring a node to a different user when re-authenticating with a
-// different user's auth key.
-// If multiple nodes exist with the same machine key (different users), the
-// first one found is returned (order is not guaranteed).
+// GetNodesByMachineKeyAllUsers returns all nodes sharing a machine key,
+// keyed by owner UserID. Tagged nodes are indexed under UserID(0).
+func (s *NodeStore) GetNodesByMachineKeyAllUsers(machineKey key.MachinePublic) map[types.UserID]types.NodeView {
+	timer := prometheus.NewTimer(nodeStoreOperationDuration.WithLabelValues("get_by_machine_key_all_users"))
+	defer timer.ObserveDuration()
+
+	nodeStoreOperations.WithLabelValues("get_by_machine_key_all_users").Inc()
+
+	snapshot := s.data.Load()
+	userMap, exists := snapshot.nodesByMachineKey[machineKey]
+	if !exists {
+		return nil
+	}
+
+	ret := make(map[types.UserID]types.NodeView, len(userMap))
+	for uid, node := range userMap {
+		ret[uid] = node
+	}
+
+	return ret
+}
+
+// GetNodeByMachineKeyAnyUser returns a deterministic node with the given
+// machine key, regardless of user. Prefer GetNodesByMachineKeyAllUsers when
+// ownership matters.
 func (s *NodeStore) GetNodeByMachineKeyAnyUser(machineKey key.MachinePublic) (types.NodeView, bool) {
 	timer := prometheus.NewTimer(nodeStoreOperationDuration.WithLabelValues("get_by_machine_key_any_user"))
 	defer timer.ObserveDuration()
 
 	nodeStoreOperations.WithLabelValues("get_by_machine_key_any_user").Inc()
 
-	snapshot := s.data.Load()
-	if userMap, exists := snapshot.nodesByMachineKey[machineKey]; exists {
-		// Return the first node found (order not guaranteed due to map iteration)
-		for _, node := range userMap {
-			return node, true
+	userMap := s.GetNodesByMachineKeyAllUsers(machineKey)
+	var (
+		selected types.NodeView
+		minID    types.UserID
+		found    bool
+	)
+
+	for uid, node := range userMap {
+		if !found || uid < minID {
+			selected = node
+			minID = uid
+			found = true
 		}
 	}
 
-	return types.NodeView{}, false
+	return selected, found
 }
 
 // DebugString returns debug information about the NodeStore.

@@ -170,11 +170,32 @@ func (i *IPAllocator) Next() (*netip.Addr, *netip.Addr, error) {
 
 var ErrCouldNotAllocateIP = errors.New("failed to allocate IP")
 
-func (i *IPAllocator) nextLocked(prev netip.Addr, prefix *netip.Prefix) (*netip.Addr, error) {
+func (i *IPAllocator) allocateNext4() (*netip.Addr, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	return i.next(prev, prefix)
+	ret, err := i.next(i.prev4, i.prefix4)
+	if err != nil {
+		return nil, err
+	}
+
+	i.prev4 = *ret
+
+	return ret, nil
+}
+
+func (i *IPAllocator) allocateNext6() (*netip.Addr, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	ret, err := i.next(i.prev6, i.prefix6)
+	if err != nil {
+		return nil, err
+	}
+
+	i.prev6 = *ret
+
+	return ret, nil
 }
 
 func (i *IPAllocator) next(prev netip.Addr, prefix *netip.Prefix) (*netip.Addr, error) {
@@ -200,30 +221,30 @@ func (i *IPAllocator) next(prev netip.Addr, prefix *netip.Prefix) (*netip.Addr, 
 		return nil, err
 	}
 
+	start := ip
 	for {
-		if !prefix.Contains(ip) {
-			return nil, ErrCouldNotAllocateIP
+		if prefix.Contains(ip) && !set.Contains(ip) && !isTailscaleReservedIP(ip) {
+			i.usedIPs.Add(ip)
+
+			return &ip, nil
 		}
 
-		// Check if the IP has already been allocated
-		// or if it is a IP reserved by Tailscale.
-		if set.Contains(ip) || isTailscaleReservedIP(ip) {
-			switch i.strategy {
-			case types.IPAllocationStrategySequential:
-				ip = ip.Next()
-			case types.IPAllocationStrategyRandom:
-				ip, err = randomNext(*prefix)
-				if err != nil {
-					return nil, fmt.Errorf("getting random IP: %w", err)
-				}
+		ip = ip.Next()
+
+		switch i.strategy {
+		case types.IPAllocationStrategySequential:
+			if !prefix.Contains(ip) {
+				return nil, ErrCouldNotAllocateIP
+			}
+		case types.IPAllocationStrategyRandom:
+			if !prefix.Contains(ip) {
+				ip = prefix.Masked().Addr()
 			}
 
-			continue
+			if ip == start {
+				return nil, ErrCouldNotAllocateIP
+			}
 		}
-
-		i.usedIPs.Add(ip)
-
-		return &ip, nil
 	}
 }
 
@@ -241,6 +262,10 @@ func randomNext(pfx netip.Prefix) (netip.Addr, error) {
 	// after.
 	tempMax := big.NewInt(0).Sub(&to, &from)
 
+	if tempMax.Sign() <= 0 {
+		return fromIP, nil
+	}
+
 	out, err := rand.Int(rand.Reader, tempMax)
 	if err != nil {
 		return netip.Addr{}, fmt.Errorf("generating random IP: %w", err)
@@ -248,7 +273,7 @@ func randomNext(pfx netip.Prefix) (netip.Addr, error) {
 
 	valInRange := big.NewInt(0).Add(&from, out)
 
-	ip, ok := netip.AddrFromSlice(valInRange.Bytes())
+	ip, ok := netip.AddrFromSlice(valInRange.FillBytes(make([]byte, len(fromIP.AsSlice()))))
 	if !ok {
 		return netip.Addr{}, errGeneratedIPBytesInvalid
 	}
@@ -304,7 +329,7 @@ func (db *HSDatabase) BackfillNodeIPs(i *IPAllocator) ([]string, error) {
 			changed := false
 			// IPv4 prefix is set, but node ip is missing, alloc
 			if i.prefix4 != nil && node.IPv4 == nil {
-				ret4, err := i.nextLocked(i.prev4, i.prefix4)
+				ret4, err := i.allocateNext4()
 				if err != nil {
 					return fmt.Errorf("allocating IPv4 for node(%d): %w", node.ID, err)
 				}
@@ -317,7 +342,7 @@ func (db *HSDatabase) BackfillNodeIPs(i *IPAllocator) ([]string, error) {
 
 			// IPv6 prefix is set, but node ip is missing, alloc
 			if i.prefix6 != nil && node.IPv6 == nil {
-				ret6, err := i.nextLocked(i.prev6, i.prefix6)
+				ret6, err := i.allocateNext6()
 				if err != nil {
 					return fmt.Errorf("allocating IPv6 for node(%d): %w", node.ID, err)
 				}
