@@ -1,287 +1,300 @@
-[中文](#中文) | [English](#english)
+# Headscale-Admin-AE
 
----
+[![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev/)
+[![Headscale Base](https://img.shields.io/badge/Base-headscale%20v0.28.0-326CE5?style=flat-square)](https://github.com/juanfont/headscale/releases/tag/v0.28.0)
+[![Backports](https://img.shields.io/badge/Backports-headscale%20v0.29.1-7C3AED?style=flat-square)](https://github.com/juanfont/headscale/releases/tag/v0.29.1)
+[![Tailscale](https://img.shields.io/badge/tailscale.com-v1.96.5-4D7CFE?style=flat-square)](https://github.com/tailscale/tailscale)
+[![Database](https://img.shields.io/badge/Database-SQLite%20%7C%20PostgreSQL-4169E1?style=flat-square)](#核心特性)
+[![License](https://img.shields.io/badge/License-BSD--3--Clause-green?style=flat-square)](LICENSE)
 
-![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go&logoColor=white)
-![Headscale Base](https://img.shields.io/badge/Headscale_Base-v0.28.0-326CE5?style=flat-square)
-![Headscale Fixes](https://img.shields.io/badge/Headscale_Fixes-v0.29.1_Backports-326CE5?style=flat-square)
-![License](https://img.shields.io/badge/License-BSD_3--Clause-green?style=flat-square)
-![DB](https://img.shields.io/badge/Database-SQLite_%7C_PostgreSQL-4169E1?style=flat-square)
+Headscale-Admin-AE 是基于官方 [headscale](https://github.com/juanfont/headscale) 的增强控制服务器，服务于自建 Tailscale/Headscale 网络和 ScaleForge Web 管理面板场景。
 
----
+它不是一个独立的 Web 面板。它负责运行控制面、注册客户端、下发网络地图、管理节点和路由；[ScaleForge](https://github.com/chen1749144759/ScaleForge) 负责提供图形化管理界面；[ScaleTail](https://github.com/chen1749144759/ScaleTail) 负责客户端连接和桌面端体验。
 
-# 中文
+## 版本定位
 
-## Headscale-Admin-AE
+| 项目项 | 当前状态 |
+|--------|----------|
+| 基础代码 | 官方 headscale `v0.28.0` |
+| 当前对标 | 官方 headscale `v0.29.1` 的关键稳定性修复 |
+| 升级方式 | 保留 AE 分支能力，手工审计并定向回补关键补丁 |
+| Go 版本 | `go.mod` 使用 Go `1.26.1` |
+| Tailscale 依赖 | `tailscale.com v1.96.5` |
+| 配套管理面板 | ScaleForge |
+| 推荐客户端 | ScaleTail，客户端核心已按 Tailscale `v1.98.5` 关键修复审计 |
 
-> 基于 headscale v0.28.0 的增强分支，为 Web 管理面板扩展了用户认证与权限字段。
+请注意：当前 main 分支不是官方 headscale `v0.29.1` 的整仓升级版。它仍然以 `v0.28.0 AE` 为基础，保留管理面板数据库扩展、数据库 ACL、MoveNode、Docker 模板和内置 DERP 改造，同时回补官方 `v0.29.1` 中对本项目有价值的稳定性修复。
 
-Headscale-Admin-AE 是对官方 [headscale](https://github.com/juanfont/headscale) 控制服务器的定制修改版本（基于 v0.28.0），由 **runyf**（[Headscale-Admin-Pro](https://github.com/arounyf/Headscale-Admin-Pro) 原作者）完成核心改造。其目标是让 headscale 与 Web 管理面板能够**共享同一个数据库**，无需额外维护独立的用户系统。
+## 这个分支解决什么问题
 
-## 当前对标版本
+官方 headscale 更偏向命令行和配置文件管理。ScaleForge 需要直接管理用户、节点、路由、ACL、预认证密钥和操作日志，因此服务端必须具备以下能力：
 
-- 基础分支：官方 headscale `v0.28.0` 的 AE 定制分支。
-- 本轮对标：官方 headscale `v0.29.1` 的注册、重注册、数据库迁移、DERP、OIDC 和 DNS 稳定性修复。
-- 当前不是整仓升级到 headscale `v0.29.1`，仍保留管理面板数据库扩展、数据库策略模式、MoveNode API、内置 DERP 环境变量等本项目能力。
-- Go 版本：`go.mod` 使用 Go `1.26.1`。
-- Tailscale 依赖：当前仍为 `tailscale.com v1.96.5`。客户端 ScaleTail 已按 Tailscale `v1.98.5` 关键修复审计，两端继续通过标准 `tailcfg` 控制协议对接。
+- 管理面板和 headscale 共用同一个数据库。
+- `users` 表可以保存登录密码、角色、过期时间、启用状态、节点配额和路由权限。
+- ACL 可以存入数据库，由管理面板在线编辑，而不是只依赖本地策略文件。
+- 节点可以在不同用户或分组之间迁移，并立刻刷新在线客户端的网络地图。
+- Docker 部署可以通过环境变量渲染配置，适合一键部署和升级。
+- 客户端断线、重连、换 key、重复提交注册请求时，服务端状态不能错乱。
 
-## 为什么需要这个分支
+Headscale-Admin-AE 就是在这些目标下维护的控制服务器分支。
 
-官方 headscale 的 `users` 表仅包含基础字段，没有密码、角色、到期时间等认证信息。Web 管理面板需要这些字段来实现用户登录和权限控制。
+## 核心特性
 
-常见的做法是让管理面板维护一套独立的用户数据库，但这会带来数据同步问题。本分支选择**直接扩展 headscale 自身的 `users` 表**，使两者共用同一份数据，架构更简洁，维护成本更低。
+### 1. 管理面板共享数据库
 
-## 核心修改
-
-### 1. 扩展 `users` 表结构
-
-在官方 `users` 表基础上新增以下字段：
+在官方 `users` 表基础上扩展管理字段，ScaleForge 可以直接读取和维护这些字段。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `password` | TEXT | 用户登录密码（哈希存储） |
-| `role` | TEXT | 用户角色（如 admin / user） |
+| `password` | TEXT | 管理面板登录密码，通常为哈希值 |
+| `role` | TEXT | 用户角色，例如 `admin` / `user` |
 | `expire` | DATETIME | 账户过期时间 |
-| `enable` | BOOLEAN | 账户启用/禁用开关 |
-| `node` | INTEGER | 节点配额限制 |
+| `enable` | BOOLEAN | 账户启用或禁用 |
+| `node` | INTEGER | 节点数量配额 |
 | `route` | TEXT | 路由权限控制 |
 
-### 2. ACL 策略数据库模式
+项目还会维护管理面板需要的 `policies`、`acl`、`log` 等兼容结构，让控制服务器和管理后台可以共用同一套 SQLite 或 PostgreSQL 数据。
 
-支持 `policy.mode: database` 配置项，将 ACL 规则存储在 `policies` 表（`data` TEXT 字段）中，不再强制依赖文件模式。
+### 2. ACL 数据库模式
 
-### 3. 数据库兼容性调整
+支持：
 
-针对管理面板的数据库访问需求进行了兼容性适配，确保 headscale 与管理面板能稳定地共享同一个 SQLite 或 PostgreSQL 数据库。
+```yaml
+policy:
+  mode: database
+```
 
-### 4. 完全 CLI 兼容
+开启后，ACL/HuJSON 策略从数据库读取，ScaleForge 可以在线编辑和保存策略。普通文件模式仍然保留，用于兼容官方 headscale 的使用习惯。
 
-编译产物仍为 `headscale` 二进制文件，所有命令行参数和用法与官方版本保持一致。
+### 3. MoveNode 热迁移 API
 
-### 5. 新增 MoveNode API
+新增节点迁移接口，可以把节点移动到另一个用户或分组，不需要重启 headscale。
 
-新增 `MoveNode` gRPC/REST 接口，支持将节点在不同用户（分组）之间迁移，**无需重启 Headscale 服务**。变更直接更新内存中的 NodeStore 快照和数据库，并自动通知所有在线节点刷新网络映射。
+```http
+POST /api/v1/node/{node_id}/user
+Content-Type: application/json
 
-- **REST 端点**：`POST /api/v1/node/{node_id}/user`
-- **请求体**：`{"user": "目标用户名"}`
-- **响应**：返回迁移后的完整 Node 对象
+{"user": "目标用户名"}
+```
 
-涉及修改的文件：
+服务端会同时更新数据库和内存中的 NodeStore，并通知在线节点刷新网络地图。这个能力主要给 ScaleForge 的“节点移动分组”功能使用。
 
-| 文件 | 变更说明 |
-|------|---------|
-| `proto/headscale/v1/node.proto` | 新增 `MoveNodeRequest` / `MoveNodeResponse` 消息定义 |
-| `proto/headscale/v1/headscale.proto` | 新增 `rpc MoveNode` 服务定义及 HTTP 路由映射 |
-| `gen/go/headscale/v1/*.go` | 由 `buf generate` 自动生成的 gRPC/gateway 代码 |
-| `hscontrol/state/state.go` | 新增 `State.MoveNode()` 方法，通过 `NodeStore.UpdateNode` 热更新内存 |
-| `hscontrol/grpcv1.go` | 新增 `MoveNode` gRPC handler |
+### 4. Docker 和环境变量部署
 
-### 6. headscale v0.29.1 核心修复回补
+`docker/config.yaml.tmpl` 支持通过环境变量渲染配置，适合和 ScaleForge 一起部署。
 
-本轮没有直接合并官方 `v0.29.1` 整仓代码，而是按本项目业务保留范围做了定向回补：
+常用变量：
 
-- 注册与重注册流程增加 MachineKey 级互斥，避免同一客户端并发注册导致重复节点或状态错乱。
-- NodeKey/MachineKey 归属校验更严格，防止 NodeKey 被其他 MachineKey 复用，也能识别同一节点重启后的合法复连。
-- 预认证密钥校验更稳：未知 key 视为不存在，过期节点重注册会重新校验 key，一次性 key 使用原子条件更新，避免重复消费。
-- 同一节点用原 NodeKey 复连时可以复用已有记录；真正更换 key 或重新注册时再走新的校验和更新流程。
-- NodeStore 更新后如果数据库写入失败会回滚内存快照，避免在线状态与数据库不一致。
-- 数据库迁移补齐零值过期时间转 `NULL`、`tags='null'` 用户归属恢复、API key 主键查询等兼容修复。
-- IP 分配补齐 /32、/128 等极小网段保护，随机 IP 生成补齐字节长度，避免异常网段下 panic。
-- DERP map shuffle 前复制 region，避免修改共享结构；OIDC cookie 使用更稳的 SameSite 与短名称；IPv4 /32 反向 DNS 生成逻辑补齐。
+| 变量 | 作用 |
+|------|------|
+| `HEADSCALE_SERVER_URL` | 客户端连接使用的控制服务器地址 |
+| `HEADSCALE_DNS_DOMAIN` | MagicDNS 基础域名 |
+| `HEADSCALE_LOG_LEVEL` | 日志级别 |
+| `DB_HOST` / `DB_PORT` / `DB_NAME` | PostgreSQL 地址和库名 |
+| `DB_USER` / `DB_PASS` | PostgreSQL 用户和密码 |
+| `DERP_DOMAIN` | 内置 DERP 对外域名或 IP |
+| `DERP_PORT` | 内置 DERP/STUN 监听端口 |
 
-## 版本兼容性
+模板默认开启 PostgreSQL、数据库策略模式和内置 DERP。
 
-| AE 版本 | headscale 基础版本 | 对标修复 | Tailscale 依赖 | 兼容管理面板 |
-|---------|-------------------|----------|----------------|-------------|
-| v0.28.0-ae | v0.28.0 | AE 基础改造 | v1.96.5 | [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) |
-| 当前 main | v0.28.0 AE 分支 | headscale v0.29.1 核心稳定性修复回补 | v1.96.5 | [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) |
+### 5. 内置 DERP 改造
 
-## 安装
+当前分支保留官方内置 DERP 能力，并做了适合一键部署的调整：
 
-### 从源码构建
+- DERP 域名和端口可由环境变量控制。
+- 允许在没有外部公开 DERP map 的情况下使用内置中继。
+- 内置 region 会被加入当前 DERP map，便于客户端 NAT 穿透失败时自动回落中继。
+
+### 6. 官方 headscale v0.29.1 关键修复回补
+
+本轮对照官方 headscale `v0.29.1`，回补了影响注册、重连、数据库和网络稳定性的修复：
+
+- MachineKey 级注册互斥，避免同一客户端并发注册造成重复节点。
+- NodeKey 与 MachineKey 归属校验，防止旧 NodeKey 被其他机器复用。
+- 已存在节点重启时可以复用原 NodeKey，不会错误消耗新的预认证密钥。
+- 过期节点重新注册会重新校验预认证密钥。
+- 一次性预认证密钥使用原子条件更新，避免并发重复消费。
+- 未知预认证密钥按不存在处理，错误语义更清晰。
+- NodeStore 更新后如果数据库写入失败，会回滚内存状态，避免内存和数据库不一致。
+- 数据库迁移补齐零值过期时间转 `NULL`、`tags='null'` 用户归属恢复、API key 主键查询等修复。
+- IP 分配器补齐 `/32`、`/128` 等极小网段处理，避免异常前缀导致 panic。
+- DERP map shuffle 前复制 region，避免修改共享配置。
+- OIDC cookie 使用更安全的 SameSite 策略和更短名称。
+- IPv4 `/32` 反向 DNS 生成逻辑补齐。
+
+## 本轮更新摘要
+
+当前 main 分支相对远程旧版本已经包含以下更新：
+
+| 类型 | 内容 |
+|------|------|
+| DERP | 支持通过环境变量配置 DERP 域名和端口 |
+| DERP | 内置 DERP 可以在没有外部公开 DERP map 的情况下工作 |
+| Docker | 完善 Docker 部署，兼容 PostgreSQL 建表和内置 entrypoint |
+| 注册稳定性 | 回补 headscale `v0.29.1` 注册、重注册、预认证密钥和 NodeStore 修复 |
+| 文档 | 重写 README，明确基础版本、对标版本、特性和配套项目 |
+
+## 架构关系
+
+```text
+ScaleTail 客户端
+  |
+  | Tailscale/headscale 控制协议
+  v
+Headscale-Admin-AE
+  |
+  | 共享数据库 + HTTP/gRPC API
+  v
+ScaleForge 管理面板
+```
+
+Headscale-Admin-AE 保持 `headscale` 二进制和 CLI 形态，客户端仍按 headscale/Tailscale 协议接入；ScaleForge 通过共享数据库和 API 完成 Web 管理。
+
+## 构建
+
+### 本地构建
 
 ```bash
 git clone https://github.com/chen1749144759/Headscale-Admin-AE.git
 cd Headscale-Admin-AE
-go build -o headscale ./cmd/headscale
+
+go build -trimpath -o headscale ./cmd/headscale
 ```
 
-### 使用方式
-
-编译后的 `headscale` 二进制文件可直接替换官方版本，配置文件格式完全兼容：
+查看版本：
 
 ```bash
-# 与官方 headscale 用法一致
-./headscale serve
-./headscale users list
-./headscale nodes list
+./headscale version
 ```
 
-## 配置
+启动服务：
 
-在标准 headscale 配置文件基础上，可启用数据库策略模式：
+```bash
+./headscale serve
+```
+
+### Docker 构建
+
+```bash
+docker build -t headscale-admin-ae:local .
+```
+
+运行时请挂载配置目录和数据目录，并按实际环境配置 `HEADSCALE_SERVER_URL`、数据库和 DERP 参数。
+
+## 配置示例
+
+最小配置仍遵循官方 headscale 配置格式。管理面板场景建议开启数据库策略模式：
 
 ```yaml
+server_url: http://你的服务器IP:8080
+
+listen_addr: 0.0.0.0:8080
+
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+database:
+  type: postgres
+  postgres:
+    host: postgres
+    port: 5432
+    name: headscale_admin
+    user: headscale_admin
+    pass: your_password
+    ssl: false
+
 policy:
-  mode: database   # 使用数据库存储 ACL 规则（默认为 file）
+  mode: database
+
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: headscale
+    region_name: Headscale Embedded DERP
+    stun_listen_addr: 0.0.0.0:3478
+    domain: 你的服务器IP或域名
+    private: true
+    verify_clients: false
 ```
 
-其余配置项与官方 headscale v0.28.0 完全一致，请参阅 [官方文档](https://headscale.net/stable/)。
+完整配置请参考 [config-example.yaml](config-example.yaml) 和 [docker/config.yaml.tmpl](docker/config.yaml.tmpl)。
+
+## 常用命令
+
+```bash
+# 创建用户
+./headscale users create admin
+
+# 创建预认证密钥
+./headscale preauthkeys create --user admin --reusable --expiration 24h
+
+# 查看节点
+./headscale nodes list
+
+# 查看路由
+./headscale nodes list-routes
+
+# 批准路由
+./headscale nodes approve-routes --identifier <node-id> --routes 192.168.1.0/24
+
+# 创建 API key，供 ScaleForge 调用
+./headscale apikey create
+```
+
+## 与 ScaleForge 配套
+
+ScaleForge 是推荐的 Web 管理面板。两者的职责分工如下：
+
+| 项目 | 职责 |
+|------|------|
+| Headscale-Admin-AE | 控制服务器、节点注册、网络地图、DERP、路由、ACL 后端能力 |
+| ScaleForge | Web 管理面板、用户登录、节点管理、ACL 编辑、部署向导、可视化运维 |
+| ScaleTail | Windows 图形客户端、连接配置、仪表盘、LocalAPI 操作 |
+
+推荐组合：
+
+- 服务端控制面：Headscale-Admin-AE
+- 服务端 Web 管理：ScaleForge
+- Windows 客户端：ScaleTail
+
+## 数据库升级注意
+
+从官方 headscale 或旧 AE 分支切换前，请先备份数据库。
+
+```bash
+# PostgreSQL 示例
+pg_dump -U headscale_admin headscale_admin > headscale_backup.sql
+```
+
+切换后建议先在测试环境确认：
+
+- 管理员用户字段是否完整。
+- 预认证密钥是否能创建和消费。
+- 已有节点是否能正常在线。
+- 断开后重新注册是否符合预期。
+- 路由批准和 ACL 策略是否能被 ScaleForge 正常读取。
+
+## 兼容性说明
+
+| 能力 | 状态 |
+|------|------|
+| 官方 headscale CLI | 保持兼容 |
+| 官方配置格式 | 保持兼容，并增加数据库策略和 AE 数据库扩展 |
+| SQLite | 支持 |
+| PostgreSQL | 支持，推荐生产环境使用 |
+| Tailscale 官方客户端 | 支持按 headscale 方式接入 |
+| ScaleTail 客户端 | 推荐 |
+| ScaleForge 管理面板 | 推荐 |
 
 ## 相关项目
 
-| 项目 | 说明 |
-|------|------|
-| [headscale](https://github.com/juanfont/headscale) | 官方 headscale 开源控制服务器 |
-| [Headscale-Admin-Pro](https://github.com/arounyf/Headscale-Admin-Pro) | 原始管理面板（runyf 开发） |
-| [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) | 配套 Web 管理面板 |
-
-## 致谢
-
-- [juanfont/headscale](https://github.com/juanfont/headscale) — 优秀的开源 Tailscale 控制服务器
-- [arounyf](https://github.com/arounyf) (runyf) — headscale 数据库扩展改造的原始作者
-- [Tailscale](https://tailscale.com/) — 现代化的 WireGuard 组网方案
+- [juanfont/headscale](https://github.com/juanfont/headscale)：官方 headscale 控制服务器。
+- [arounyf/Headscale-Admin-Pro](https://github.com/arounyf/Headscale-Admin-Pro)：早期 Headscale 管理面板。
+- [ScaleForge](https://github.com/chen1749144759/ScaleForge)：配套 Web 管理面板。
+- [ScaleTail](https://github.com/chen1749144759/ScaleTail)：配套图形化客户端。
+- [tailscale/tailscale](https://github.com/tailscale/tailscale)：Tailscale 客户端和网络核心。
 
 ## 许可证
 
-本项目基于 [BSD 3-Clause License](LICENSE) 开源，与 headscale 保持一致。
-
----
-
-# English
-
-## Headscale-Admin-AE
-
-> An enhanced fork of headscale v0.28.0 with extended user authentication and permission fields for web admin panel integration.
-
-Headscale-Admin-AE is a modified version of the official [headscale](https://github.com/juanfont/headscale) control server (based on v0.28.0), with core modifications by **runyf** (original author of [Headscale-Admin-Pro](https://github.com/arounyf/Headscale-Admin-Pro)). It enables headscale and a web admin panel to **share a single database**, eliminating the need for a separate user management system.
-
-## Current Upstream Targets
-
-- Base branch: the AE customized branch based on official headscale `v0.28.0`.
-- Current backport target: key registration, re-registration, database migration, DERP, OIDC, and DNS stability fixes from official headscale `v0.29.1`.
-- This is not a full repository upgrade to headscale `v0.29.1`; the project keeps its admin-panel database extensions, database policy mode, MoveNode API, embedded DERP environment overrides, and other AE-specific behavior.
-- Go version: `go.mod` uses Go `1.26.1`.
-- Tailscale dependency: still `tailscale.com v1.96.5`. The ScaleTail client has been audited against key Tailscale `v1.98.5` fixes, and both sides continue to communicate through the standard `tailcfg` control protocol.
-
-## Why This Fork
-
-The official headscale `users` table only contains basic fields — no password, role, or expiration data. A web admin panel requires these fields to provide user login and access control.
-
-A common approach is to maintain a separate user database for the admin panel, but this introduces data synchronization issues. This fork takes a different approach: **extend headscale's own `users` table directly**, so both systems share one data source. Simpler architecture, lower maintenance overhead.
-
-## Key Modifications
-
-### 1. Extended `users` Table
-
-The following columns are added to the official `users` table:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `password` | TEXT | User login password (hashed) |
-| `role` | TEXT | User role (e.g., admin / user) |
-| `expire` | DATETIME | Account expiration time |
-| `enable` | BOOLEAN | Account enabled/disabled flag |
-| `node` | INTEGER | Node quota limit |
-| `route` | TEXT | Route permission control |
-
-### 2. ACL Policy Database Mode
-
-Supports `policy.mode: database` configuration, storing ACL rules in a `policies` table (`data` TEXT field) instead of requiring file-based policy management.
-
-### 3. Database Compatibility
-
-Includes compatibility adjustments so that headscale and the admin panel can reliably share the same SQLite or PostgreSQL database.
-
-### 4. Full CLI Compatibility
-
-The compiled binary is still named `headscale`. All command-line arguments and usage remain identical to the official version.
-
-### 5. New MoveNode API
-
-A new `MoveNode` gRPC/REST endpoint that allows moving nodes between users (groups) **without restarting the Headscale service**. Changes are applied directly to the in-memory NodeStore snapshot and the database, and all connected nodes are automatically notified to refresh their network maps.
-
-- **REST endpoint**: `POST /api/v1/node/{node_id}/user`
-- **Request body**: `{"user": "target_username"}`
-- **Response**: Returns the complete Node object after migration
-
-Modified files:
-
-| File | Description |
-|------|-------------|
-| `proto/headscale/v1/node.proto` | Added `MoveNodeRequest` / `MoveNodeResponse` message definitions |
-| `proto/headscale/v1/headscale.proto` | Added `rpc MoveNode` service definition with HTTP route mapping |
-| `gen/go/headscale/v1/*.go` | Auto-generated gRPC/gateway code via `buf generate` |
-| `hscontrol/state/state.go` | Added `State.MoveNode()` method with hot-update via `NodeStore.UpdateNode` |
-| `hscontrol/grpcv1.go` | Added `MoveNode` gRPC handler |
-
-### 6. headscale v0.29.1 Stability Backports
-
-This round does not merge the entire official `v0.29.1` tree. Instead, it selectively backports the fixes that matter to this fork:
-
-- Registration and re-registration now use a MachineKey-level lock to avoid duplicate nodes or inconsistent state during concurrent registration.
-- NodeKey/MachineKey ownership checks are stricter, preventing NodeKey reuse by another MachineKey while still allowing valid restarts from the same node.
-- Pre-auth key validation is safer: unknown keys are treated as missing, expired-node re-registration revalidates the key, and one-time key consumption uses an atomic conditional update.
-- A same-node reconnect with the existing NodeKey can reuse the existing record; real key changes or re-registration paths still go through validation and update.
-- NodeStore changes are rolled back if the database write fails, avoiding divergence between in-memory state and persistent state.
-- Database migrations include zero expiry to `NULL`, `tags='null'` user ownership recovery, and explicit API key primary-key lookup fixes.
-- IP allocation now handles tiny /32 and /128 prefixes and pads random IP bytes correctly to avoid panics on unusual prefixes.
-- DERP region shuffle now works on cloned regions, OIDC cookies use safer SameSite and shorter names, and IPv4 /32 reverse-DNS generation is fixed.
-
-## Version Compatibility
-
-| AE Version | Headscale Base | Backported Fixes | Tailscale Dependency | Compatible Admin Panel |
-|-------------|---------------|------------------|----------------------|------------------------|
-| v0.28.0-ae | v0.28.0 | AE baseline changes | v1.96.5 | [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) |
-| current main | v0.28.0 AE branch | headscale v0.29.1 core stability fixes | v1.96.5 | [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) |
-
-## Installation
-
-### Build from Source
-
-```bash
-git clone https://github.com/chen1749144759/Headscale-Admin-AE.git
-cd Headscale-Admin-AE
-go build -o headscale ./cmd/headscale
-```
-
-### Usage
-
-The compiled `headscale` binary is a drop-in replacement for the official version. Configuration file format is fully compatible:
-
-```bash
-# Same usage as official headscale
-./headscale serve
-./headscale users list
-./headscale nodes list
-```
-
-## Configuration
-
-On top of the standard headscale configuration, you can enable database policy mode:
-
-```yaml
-policy:
-  mode: database   # Store ACL rules in database (default: file)
-```
-
-All other configuration options are identical to official headscale v0.28.0. Refer to the [official documentation](https://headscale.net/stable/) for details.
-
-## Related Projects
-
-| Project | Description |
-|---------|-------------|
-| [headscale](https://github.com/juanfont/headscale) | Official open-source headscale control server |
-| [Headscale-Admin-Pro](https://github.com/arounyf/Headscale-Admin-Pro) | Original admin panel by runyf |
-| [Headscale-Admin-Reforged](https://github.com/chen1749144759/Headscale-Admin-Reforged) | Companion web admin panel |
-
-## Credits
-
-- [juanfont/headscale](https://github.com/juanfont/headscale) — The excellent open-source Tailscale control server
-- [arounyf](https://github.com/arounyf) (runyf) — Original author of the headscale database extension modifications
-- [Tailscale](https://tailscale.com/) — Modern WireGuard-based networking
-
-## License
-
-This project is licensed under the [BSD 3-Clause License](LICENSE), consistent with headscale.
+本项目保持与 headscale 一致，使用 [BSD 3-Clause License](LICENSE)。
