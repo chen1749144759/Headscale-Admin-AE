@@ -1337,6 +1337,20 @@ func ensureAdminProSchema(dbConn *gorm.DB) error {
 				config JSONB,
 				updated_at TIMESTAMP DEFAULT NOW()
 			)`,
+			`CREATE TABLE IF NOT EXISTS client_releases (
+				id SERIAL PRIMARY KEY,
+				version TEXT NOT NULL,
+				platform TEXT NOT NULL DEFAULT 'windows-amd64',
+				update_type TEXT NOT NULL DEFAULT 'suggested',
+				title TEXT,
+				description TEXT,
+				download_url TEXT,
+				release_notes TEXT,
+				enabled BOOLEAN DEFAULT TRUE,
+				created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+				created_at TIMESTAMP DEFAULT NOW(),
+				updated_at TIMESTAMP DEFAULT NOW()
+			)`,
 		}
 	} else {
 		createTables = []string{
@@ -1492,6 +1506,20 @@ func ensureAdminProSchema(dbConn *gorm.DB) error {
 				config TEXT,
 				updated_at DATETIME
 			)`,
+			`CREATE TABLE IF NOT EXISTS client_releases (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				version TEXT NOT NULL,
+				platform TEXT NOT NULL DEFAULT 'windows-amd64',
+				update_type TEXT NOT NULL DEFAULT 'suggested',
+				title TEXT,
+				description TEXT,
+				download_url TEXT,
+				release_notes TEXT,
+				enabled INTEGER DEFAULT 1,
+				created_by INTEGER,
+				created_at DATETIME,
+				updated_at DATETIME
+			)`,
 		}
 	}
 	for _, sql := range createTables {
@@ -1536,6 +1564,8 @@ func ensureAdminProSchema(dbConn *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_security_events_level ON security_events(level)",
 		"CREATE INDEX IF NOT EXISTS idx_security_events_created_at ON security_events(created_at)",
 		"CREATE INDEX IF NOT EXISTS idx_trusted_networks_kind_value ON trusted_networks(kind, value)",
+		"CREATE INDEX IF NOT EXISTS idx_client_releases_enabled_platform ON client_releases(enabled, platform)",
+		"CREATE INDEX IF NOT EXISTS idx_client_releases_created_at ON client_releases(created_at)",
 	}
 	for _, sql := range createIndexes {
 		if err := dbConn.Exec(sql).Error; err != nil {

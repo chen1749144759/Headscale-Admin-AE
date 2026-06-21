@@ -65,6 +65,7 @@ Headscale-Admin-AE 是基于官方 headscale 裂变的增强控制服务，服�
 | `security_events` | 安全事件 |
 | `trusted_networks` | 可信网络 |
 | `risk_rules` | 风险规则 |
+| `client_releases` | ScaleTail 客户端版本发布和强制/建议更新策略 |
 
 这些表与 ScaleForge 后端 SQL 保持一致。Headscale-Admin-AE 负责在控制服务启动时兜底创建，ScaleForge 负责业务读写和页面展示。
 
