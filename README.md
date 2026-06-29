@@ -150,6 +150,14 @@ Headscale-Admin-AE 是控制面；ScaleForge 是管理面；ScaleTail 是客户�
 - 与 ScaleForge 强绑定的自定义表不属于官方 headscale 标准 schema。
 - 继续追上游版本时必须先审计注册、数据库迁移、NodeStore、DERP、ACL 和 Docker 模板差异。
 
+## 交流学习
+
+欢迎加入 ScaleForge 交流群，一起交流自建 Headscale、ScaleTail、ScaleForge 的部署、使用和二次开发经验。
+
+群号：`1041671099`
+
+<img src="docs/images/scaleforge-qq-group.jpg" alt="ScaleForge 交流群" width="360">
+
 ## 打赏
 
 如果这个项目帮你节省了部署和维护时间，可以请作者喝杯咖啡。打赏二维码维护在 ScaleForge 仓库中：
