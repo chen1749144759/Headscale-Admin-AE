@@ -15,6 +15,20 @@ enforcement, and DERP routing for self-hosted tailnets.
 These rules govern how you work in this repo. They are listed first
 because they shape every other decision.
 
+### ScaleTail workflow overlay
+
+This repository is maintained as the server-side ScaleTail/ScaleForge fork.
+After each requested change, run the relevant minimal verification, commit the
+change, and push the current branch by default.
+
+- Do not stop at a local commit unless the user explicitly says not to push.
+- If unrelated local changes exist, identify them separately and do not mix
+  them into the requested commit without user approval.
+- For changes spanning `ScaleTail`, `ScaleForge`, and `Headscale-Admin-AE`,
+  commit and push each repository separately.
+- After pushing, confirm `git status --short --branch` is clean or only leaves
+  changes the user explicitly asked to keep.
+
 ### Ask with comprehensive multiple-choice options
 
 When you need to clarify intent, scope, or approach, use the
