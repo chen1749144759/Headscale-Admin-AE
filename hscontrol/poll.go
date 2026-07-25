@@ -224,6 +224,10 @@ func (m *mapSession) serveLongPoll() {
 	mapReqChange, err := m.h.state.UpdateNodeFromMapRequest(m.node.ID, m.req)
 	if err != nil {
 		m.log.Error().Caller().Err(err).Msg("failed to update node from initial MapRequest")
+		// Do not let net/http turn this into an empty 200 response. Clients
+		// otherwise interpret it as unexpected EOF and retry indefinitely.
+		httpError(m.w, err)
+
 		return
 	}
 
@@ -246,6 +250,8 @@ func (m *mapSession) serveLongPoll() {
 	// time between the node connecting and the batcher being ready.
 	if err := m.h.mapBatcher.AddNode(m.node.ID, m.ch, m.capVer, m.stopFromBatcher); err != nil { //nolint:noinlineerr
 		m.log.Error().Caller().Err(err).Msg("failed to add node to batcher")
+		httpError(m.w, err)
+
 		return
 	}
 

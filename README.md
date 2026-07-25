@@ -2,7 +2,7 @@
 
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![Base](https://img.shields.io/badge/Base-headscale%20v0.28.0-326CE5)](https://github.com/juanfont/headscale/releases/tag/v0.28.0)
-[![Backports](https://img.shields.io/badge/Backports-headscale%20v0.29.1-7C3AED)](https://github.com/juanfont/headscale/releases/tag/v0.29.1)
+[![Backports](https://img.shields.io/badge/Backports-headscale%20v0.29.2-7C3AED)](https://github.com/juanfont/headscale/releases/tag/v0.29.2)
 [![Tailscale Lib](https://img.shields.io/badge/tailscale.com-v1.96.5-4D7CFE)](https://github.com/tailscale/tailscale)
 [![Database](https://img.shields.io/badge/Database-SQLite%20%7C%20PostgreSQL-4169E1)](#部署难度)
 
@@ -15,8 +15,8 @@ Headscale-Admin-AE 是基于官方 headscale 裂变的增强控制服务，服�
 | 项目项 | 当前说明 |
 |---|---|
 | 裂变来源 | 基于官方 `juanfont/headscale v0.28.0` 的 AE 增强分支继续维护 |
-| 当前对标 | 定向回补官方 headscale `v0.29.1` 中对本项目有价值的注册、重连、数据库和稳定性修复 |
-| 升级策略 | 不直接整仓升级到 v0.29.1，优先保留 AE 自定义能力，再按审计结果回补关键修复 |
+| 当前对标 | 定向回补官方 headscale `v0.29.2` 中对本项目有价值的注册、重连、策略并发和稳定性修复 |
+| 升级策略 | 不直接整仓升级到 v0.29.2，优先保留 AE 自定义能力，再按审计结果回补关键修复 |
 | Go 版本 | `go.mod` 使用 Go `1.26.1` |
 | Tailscale 依赖 | `tailscale.com v1.96.5` |
 | 配套管理平台 | `ScaleForge` |
@@ -34,6 +34,7 @@ Headscale-Admin-AE 是基于官方 headscale 裂变的增强控制服务，服�
 - 支持 PostgreSQL 和 SQLite 两种数据库。
 - 启动时同步管理平台需要的自定义表和索引，降低 ScaleForge 首次启动缺表风险。
 - 回补官方 headscale v0.29.1 中影响注册、重注册、预认证密钥、NodeStore、数据库迁移和 IP 分配稳定性的关键修复。
+- 回补官方 headscale v0.29.2 的策略读锁/缓存并发、网络图异常节点隔离、无效 FQDN 启动体检、注册错误响应和 `/ts2021` WebSocket GET 兼容修复。
 
 ## 新增/扩展数据结构
 
@@ -65,11 +66,11 @@ Headscale-Admin-AE 是基于官方 headscale 裂变的增强控制服务，服�
 | `security_events` | 安全事件 |
 | `trusted_networks` | 可信网络 |
 | `risk_rules` | 风险规则 |
-| `client_releases` | ScaleTail 客户端版本发布和强制/建议更新策略 |
+| `client_releases` | ScaleTail 客户端版本、强制/建议更新策略及 OTA 哈希/签名元数据 |
 
 这些表与 ScaleForge 后端 SQL 保持一致。Headscale-Admin-AE 负责在控制服务启动时兜底创建，ScaleForge 负责业务读写和页面展示。
 
-## 对标官方 v0.29.1 的关键回补
+## 对标官方 v0.29.2 的关键回补
 
 - MachineKey 级注册互斥，降低并发注册导致重复节点的风险。
 - NodeKey 与 MachineKey 归属校验，避免旧 NodeKey 被错误复用。
@@ -83,6 +84,11 @@ Headscale-Admin-AE 是基于官方 headscale 裂变的增强控制服务，服�
 - DERP map shuffle 前复制 region，避免修改共享配置。
 - OIDC cookie 使用更安全的 SameSite 策略和更短名称。
 - IPv4 `/32` 反向 DNS 生成逻辑补齐。
+- 策略管理器读路径使用读锁，并将高并发缓存切换为并发 Map，降低网络图生成期间的锁竞争和重连风暴。
+- 单个节点名称/FQDN 异常时记录告警并跳过该节点，避免一次坏数据拖垮整张网络图。
+- 启动时只读扫描历史节点名称，明确提示需要重命名的节点，不在启动阶段擅自修改数据库。
+- 网络图和节点注册失败会返回明确 HTTP 错误，避免客户端收到空 200 后持续 `unexpected EOF` 重试。
+- `/ts2021` 同时接受 GET 和 POST，兼容 WebSocket/JS/WASM 控制客户端。
 
 ## 部署难度
 
@@ -146,7 +152,7 @@ Headscale-Admin-AE 是控制面；ScaleForge 是管理面；ScaleTail 是客户�
 
 ## 已知边界
 
-- 当前不是官方 headscale v0.29.1 的整仓升级版本，而是 v0.28.0 AE 分支上的定向回补版本。
+- 当前不是官方 headscale v0.29.2 的整仓升级版本，而是 v0.28.0 AE 分支上的定向回补版本。
 - 与 ScaleForge 强绑定的自定义表不属于官方 headscale 标准 schema。
 - 继续追上游版本时必须先审计注册、数据库迁移、NodeStore、DERP、ACL 和 Docker 模板差异。
 

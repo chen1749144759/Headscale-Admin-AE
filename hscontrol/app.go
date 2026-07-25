@@ -518,6 +518,7 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 	r.Use(securityHeaders)
 
 	r.Post(ts2021UpgradePath, h.NoiseUpgradeHandler)
+	r.Get(ts2021UpgradePath, h.NoiseUpgradeHandler)
 
 	r.Get("/robots.txt", h.RobotsHandler)
 	r.Get("/health", h.HealthHandler)

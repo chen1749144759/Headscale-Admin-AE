@@ -283,7 +283,7 @@ func NewState(cfg *types.Config) (*State, error) {
 	)
 	nodeStore.Start()
 
-	return &State{
+	s := &State{
 		cfg: cfg,
 
 		db:            db,
@@ -295,7 +295,13 @@ func NewState(cfg *types.Config) (*State, error) {
 		pings:         newPingTracker(),
 
 		sshCheckAuth: make(map[sshCheckPair]time.Time),
-	}, nil
+	}
+
+	// Report legacy rows that cannot be represented in a network map. The
+	// startup audit is read-only and leaves repair decisions to the operator.
+	s.logNodeHealth()
+
+	return s, nil
 }
 
 // Close gracefully shuts down the State instance and releases all resources.
@@ -1054,7 +1060,7 @@ func (s *State) MoveNode(nodeID types.NodeID, newUserName string) (types.NodeVie
 // auto-sanitisation) and collisions error out rather than silently
 // bumping a user-facing label. See HOSTNAME.md for the CLI contract.
 func (s *State) RenameNode(nodeID types.NodeID, newName string) (types.NodeView, change.Change, error) {
-	err := dnsname.ValidLabel(newName)
+	err := types.ValidateGivenName(newName, s.cfg.BaseDomain)
 	if err != nil {
 		return types.NodeView{}, change.Change{}, fmt.Errorf("renaming node: %w", err)
 	}

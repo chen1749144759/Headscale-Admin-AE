@@ -8,6 +8,8 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
+	"github.com/rs/zerolog/log"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
 	"tailscale.com/util/multierr"
@@ -141,7 +143,14 @@ func (b *MapResponseBuilder) WithSSHPolicy() *MapResponseBuilder {
 
 	sshPolicy, err := b.mapper.state.SSHPolicy(node)
 	if err != nil {
-		b.addError(err)
+		// SSH policy is optional. Keep the node connected even when an invalid
+		// policy entry cannot be compiled, and leave an actionable warning.
+		log.Warn().Caller().
+			Err(err).
+			Uint64(zf.NodeID, node.ID().Uint64()).
+			Str(zf.NodeHostname, node.Hostname()).
+			Msg("building map response: skipping invalid SSH policy")
+
 		return b
 	}
 
@@ -263,7 +272,16 @@ func (b *MapResponseBuilder) buildTailPeers(peers views.Slice[types.NodeView]) (
 			return b.mapper.state.RoutesForPeer(node, peer, matchers)
 		}, b.mapper.cfg)
 		if err != nil {
-			return nil, err
+			// A single legacy node with an invalid DNS name must not prevent all
+			// of its visible peers from receiving a usable network map.
+			log.Warn().Caller().
+				Err(err).
+				Uint64(zf.NodeID, peer.ID().Uint64()).
+				Str(zf.NodeHostname, peer.Hostname()).
+				Uint64("map.viewer.node.id", b.nodeID.Uint64()).
+				Msgf("dropping peer %d from map response; fix with `headscale nodes rename %d <name>`", peer.ID(), peer.ID())
+
+			continue
 		}
 
 		tailPeers = append(tailPeers, tn)

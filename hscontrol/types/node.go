@@ -20,6 +20,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
+	"tailscale.com/util/dnsname"
 )
 
 var (
@@ -513,6 +514,18 @@ func (node *Node) GetFQDN(baseDomain string) (string, error) {
 	}
 
 	return hostname, nil
+}
+
+// ValidateGivenName verifies both the DNS label and the final FQDN length.
+// A label can be valid on its own but still overflow when base_domain is added.
+func ValidateGivenName(givenName, baseDomain string) error {
+	if err := dnsname.ValidLabel(givenName); err != nil {
+		return fmt.Errorf("%q is not a valid DNS label: %w", givenName, err)
+	}
+
+	_, err := (&Node{GivenName: givenName}).GetFQDN(baseDomain)
+
+	return err
 }
 
 // AnnouncedRoutes returns the list of routes the node announces, as

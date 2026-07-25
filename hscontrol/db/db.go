@@ -1345,6 +1345,9 @@ func ensureAdminProSchema(dbConn *gorm.DB) error {
 				title TEXT,
 				description TEXT,
 				download_url TEXT,
+				sha256 TEXT,
+				signature TEXT,
+				file_size BIGINT,
 				release_notes TEXT,
 				enabled BOOLEAN DEFAULT TRUE,
 				created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -1514,6 +1517,9 @@ func ensureAdminProSchema(dbConn *gorm.DB) error {
 				title TEXT,
 				description TEXT,
 				download_url TEXT,
+				sha256 TEXT,
+				signature TEXT,
+				file_size INTEGER,
 				release_notes TEXT,
 				enabled INTEGER DEFAULT 1,
 				created_by INTEGER,
@@ -1546,6 +1552,24 @@ func ensureAdminProSchema(dbConn *gorm.DB) error {
 		}
 		if err := dbConn.Exec(sql).Error; err != nil && !isDuplicateColumnError(err) {
 			log.Warn().Err(err).Str("column", col.name).Msg("Failed to add flow_summaries column (non-fatal)")
+		}
+	}
+
+	releaseColumns := []struct {
+		name    string
+		sqlType string
+	}{
+		{"sha256", "text"},
+		{"signature", "text"},
+		{"file_size", "bigint"},
+	}
+	for _, col := range releaseColumns {
+		sql := fmt.Sprintf("ALTER TABLE client_releases ADD COLUMN %s %s", col.name, col.sqlType)
+		if isPostgres {
+			sql = fmt.Sprintf("ALTER TABLE client_releases ADD COLUMN IF NOT EXISTS %s %s", col.name, col.sqlType)
+		}
+		if err := dbConn.Exec(sql).Error; err != nil && !isDuplicateColumnError(err) {
+			log.Warn().Err(err).Str("column", col.name).Msg("Failed to add client_releases column (non-fatal)")
 		}
 	}
 
