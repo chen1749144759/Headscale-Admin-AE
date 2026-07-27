@@ -21,6 +21,7 @@ Headscale-Admin-AE 是基于官方 headscale 裂变的增强控制服务，服�
 | Tailscale 依赖 | `tailscale.com v1.96.5` |
 | 配套管理平台 | `ScaleForge` |
 | 推荐客户端 | `ScaleTail` |
+| 当前 Docker 镜像 | `chenzeshi/headscale-admin-ae:20260727-387705f` |
 
 本项目仍保持 headscale 控制服务定位，二进制和 CLI 形态以 headscale 为核心；ScaleForge 通过共享数据库和 API 与它协同工作。
 
@@ -126,6 +127,34 @@ go build -trimpath -o headscale ./cmd/headscale
 ```bash
 go test ./hscontrol/db
 ```
+
+## Docker 部署与升级
+
+推荐通过 ScaleForge 仓库的 Compose 文件部署，固定使用：
+
+```dotenv
+AE_VERSION=20260727-387705f
+```
+
+首次部署和升级步骤参见 [ScaleForge Docker Compose 文档](https://github.com/chen1749144759/ScaleForge#docker-compose-首次部署)。控制服务、ScaleForge 和 PostgreSQL 必须使用同一套数据库配置；不要额外启动一个指向不同数据库的 Headscale 实例。
+
+单独验证镜像可执行文件：
+
+```bash
+docker pull chenzeshi/headscale-admin-ae:20260727-387705f
+docker run --rm chenzeshi/headscale-admin-ae:20260727-387705f headscale version
+```
+
+生产升级时：
+
+1. 先备份 PostgreSQL 和 Headscale 配置、状态目录。
+2. 保留 PostgreSQL、Headscale 数据卷，不执行 `docker compose down -v`。
+3. 更新 `AE_VERSION` 后执行 `docker compose pull headscale` 和 `docker compose up -d headscale`。
+4. 确认 `curl -fsS http://127.0.0.1:8080/health` 返回成功。
+5. 检查 `docker compose logs --tail=100 headscale`，确认数据库迁移、ACL、DERP 和服务 URL 没有报错。
+6. 使用现有 ScaleTail 节点验证重连、节点列表、路由宣告和网络互通。
+
+本项目会在启动时增量补齐 ScaleForge 配套表结构，但不会要求清空现有数据卷。数据库账号缺少 DDL 权限时，容器可能启动但新增平台能力不可用，因此健康检查之后仍需检查启动日志。
 
 ## 三件套关系
 
