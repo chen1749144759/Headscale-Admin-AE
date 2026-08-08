@@ -26,12 +26,13 @@ The ports in use vary with the intended scenario and enabled features. Some of t
 - udp/3478
     - Expose publicly: yes
     - STUN, required if the [embedded DERP server](../ref/derp.md) is enabled
-- tcp/50443
-    - Expose publicly: yes
-    - Only required if the gRPC interface is used to [remote-control Headscale](../ref/api.md#grpc).
 - tcp/9090
     - Expose publicly: no
     - [Metrics and debug endpoint](../ref/debug.md#metrics-and-debug-endpoint)
+
+Headscale-Admin-AE does not expose a remote gRPC administration port. Local
+administration and ScaleForge integration use private Unix sockets; see the
+[private API boundary](../ref/api.md).
 
 ## Assumptions
 

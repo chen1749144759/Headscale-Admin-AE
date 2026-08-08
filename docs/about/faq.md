@@ -159,9 +159,9 @@ indicates which part of the policy is invalid. Follow these steps to fix your po
 
 !!! warning "Full server configuration required"
 
-    The above commands to get/set the policy require a complete server configuration file including database settings. A
-    minimal config to [control Headscale via remote CLI](../ref/api.md#grpc) is not sufficient. You may use
-    `headscale -c /path/to/config.yaml` to specify the path to an alternative configuration file.
+    The above commands to get/set the policy require a complete server configuration file including database settings.
+    Headscale-Admin-AE does not support remote CLI/API-Key administration. Run the command on the server with access to
+    the private Unix socket, or use `headscale -c /path/to/config.yaml` to specify an alternative complete configuration.
 
 ## How can I migrate back to the recommended IP prefixes?
 

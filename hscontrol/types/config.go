@@ -6,11 +6,9 @@ import (
 	"io/fs"
 	"net/netip"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
-	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/prometheus/common/model"
 	"github.com/rs/zerolog"
@@ -23,18 +21,11 @@ import (
 	"tailscale.com/util/set"
 )
 
-const (
-	PKCEMethodPlain string = "plain"
-	PKCEMethodS256  string = "S256"
-
-	defaultNodeStoreBatchSize = 100
-)
+const defaultNodeStoreBatchSize = 100
 
 var (
-	errOidcMutuallyExclusive     = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
 	errServerURLSuffix           = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
 	errServerURLSame             = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
-	errInvalidPKCEMethod         = errors.New("pkce.method must be either 'plain' or 'S256'")
 	ErrNoPrefixConfigured        = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
 	ErrInvalidAllocationStrategy = errors.New("invalid prefix allocation strategy")
 )
@@ -96,8 +87,6 @@ type Config struct {
 	ServerURL           string
 	Addr                string
 	MetricsAddr         string
-	GRPCAddr            string
-	GRPCAllowInsecure   bool
 	Node                NodeConfig
 	PrefixV4            *netip.Prefix
 	PrefixV6            *netip.Prefix
@@ -128,8 +117,6 @@ type Config struct {
 	UnixSocket           string
 	UnixSocketPermission fs.FileMode
 
-	OIDC OIDCConfig
-
 	LogTail             LogTailConfig
 	RandomizeClientPort bool
 	Taildrop            TaildropConfig
@@ -139,6 +126,20 @@ type Config struct {
 	Policy PolicyConfig
 
 	Tuning Tuning
+
+	ScaleForge ScaleForgeConfig
+}
+
+type ScaleForgeConfig struct {
+	Socket                string
+	SocketPermission      fs.FileMode
+	BackendSocket         string
+	InternalAuthKeyFile   string
+	TrustProxy            bool
+	TrustedProxyCIDRs     []netip.Prefix
+	MaxNodesPerAccount    int
+	BootstrapUsername     string
+	BootstrapPasswordFile string
 }
 
 type DNSConfig struct {
@@ -149,6 +150,33 @@ type DNSConfig struct {
 	SearchDomains    []string            `mapstructure:"search_domains"`
 	ExtraRecords     []tailcfg.DNSRecord `mapstructure:"extra_records"`
 	ExtraRecordsPath string              `mapstructure:"extra_records_path"`
+}
+
+// RuntimeDNSConfig contains the DNS fields ScaleForge can safely change while
+// Headscale is running. BaseDomain and split DNS remain startup configuration.
+type RuntimeDNSConfig struct {
+	MagicDNS          bool     `json:"magicDNS"`
+	OverrideLocalDNS  bool     `json:"overrideLocalDNS"`
+	GlobalNameservers []string `json:"globalNameservers"`
+	SearchDomains     []string `json:"searchDomains"`
+}
+
+func RuntimeDNSConfigFrom(config DNSConfig) RuntimeDNSConfig {
+	return RuntimeDNSConfig{
+		MagicDNS:          config.MagicDNS,
+		OverrideLocalDNS:  config.OverrideLocalDNS,
+		GlobalNameservers: append([]string(nil), config.Nameservers.Global...),
+		SearchDomains:     append([]string(nil), config.SearchDomains...),
+	}
+}
+
+func (runtime RuntimeDNSConfig) ApplyTo(config DNSConfig) DNSConfig {
+	config.MagicDNS = runtime.MagicDNS
+	config.OverrideLocalDNS = runtime.OverrideLocalDNS
+	config.Nameservers.Global = append([]string(nil), runtime.GlobalNameservers...)
+	config.SearchDomains = append([]string(nil), runtime.SearchDomains...)
+
+	return config
 }
 
 type Nameservers struct {
@@ -255,10 +283,7 @@ type TaildropConfig struct {
 }
 
 type CLIConfig struct {
-	Address  string
-	APIKey   string `json:"-"` // never serialise the headscale admin API key
-	Timeout  time.Duration
-	Insecure bool
+	Timeout time.Duration
 }
 
 type PolicyConfig struct {
@@ -304,7 +329,7 @@ type Tuning struct {
 	// RegisterCacheMaxEntries bounds the number of pending registration
 	// entries the auth cache will hold. Older entries are evicted (LRU)
 	// when the cap is reached, preventing unauthenticated cache-fill DoS.
-	// A value of 0 falls back to defaultRegisterCacheMaxEntries (1024).
+	// A value of 0 falls back to defaultRegisterCacheMaxEntries (256).
 	RegisterCacheMaxEntries int
 
 	// NodeStoreBatchSize controls how many write operations are accumulated
@@ -334,14 +359,6 @@ type Tuning struct {
 	// but trigger more frequent (expensive) peer map rebuilds. Higher values
 	// optimize for bulk throughput at the cost of individual operation latency.
 	NodeStoreBatchTimeout time.Duration
-}
-
-func validatePKCEMethod(method string) error {
-	if method != PKCEMethodPlain && method != PKCEMethodS256 {
-		return errInvalidPKCEMethod
-	}
-
-	return nil
 }
 
 // Domain returns the hostname/domain part of the ServerURL.
@@ -404,10 +421,14 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("derp.update_frequency", "3h")
 
 	viper.SetDefault("unix_socket", "/var/run/headscale/headscale.sock")
-	viper.SetDefault("unix_socket_permission", "0o770")
-
-	viper.SetDefault("grpc_listen_addr", ":50443")
-	viper.SetDefault("grpc_allow_insecure", false)
+	viper.SetDefault("unix_socket_permission", "0770")
+	viper.SetDefault("scaleforge.socket", "/var/run/scaleforge/control/api.sock")
+	viper.SetDefault("scaleforge.socket_permission", "0660")
+	viper.SetDefault("scaleforge.backend_socket", "/var/run/scaleforge/client/api.sock")
+	viper.SetDefault("scaleforge.internal_auth_key_file", "/run/secrets/scaleforge_internal_auth_key")
+	viper.SetDefault("scaleforge.trust_proxy", false)
+	viper.SetDefault("scaleforge.trusted_proxy_cidrs", []string{})
+	viper.SetDefault("scaleforge.max_nodes_per_account", 20)
 
 	viper.SetDefault("cli.timeout", "5s")
 	viper.SetDefault("cli.insecure", false)
@@ -419,13 +440,6 @@ func LoadConfig(path string, isFile bool) error {
 
 	viper.SetDefault("database.sqlite.write_ahead_log", true)
 	viper.SetDefault("database.sqlite.wal_autocheckpoint", 1000) // SQLite default
-
-	viper.SetDefault("oidc.scope", []string{oidc.ScopeOpenID, "profile", "email"})
-	viper.SetDefault("oidc.only_start_if_oidc_is_available", true)
-	viper.SetDefault("oidc.use_expiry_from_token", false)
-	viper.SetDefault("oidc.pkce.enabled", false)
-	viper.SetDefault("oidc.pkce.method", "S256")
-	viper.SetDefault("oidc.email_verified_required", true)
 
 	viper.SetDefault("logtail.enabled", false)
 	viper.SetDefault("randomize_client_port", false)
@@ -526,22 +540,8 @@ func validateServerConfig() error {
 	depr.fatal("dns.use_username_in_magic_dns")
 	depr.fatal("dns_config.use_username_in_magic_dns")
 
-	// Removed since version v0.26.0
-	depr.fatal("oidc.strip_email_domain")
-	depr.fatal("oidc.map_legacy_users")
-
 	// Deprecated: ephemeral_node_inactivity_timeout -> node.ephemeral.inactivity_timeout
 	depr.warnNoAlias("node.ephemeral.inactivity_timeout", "ephemeral_node_inactivity_timeout")
-
-	// Removed: oidc.expiry -> node.expiry
-	depr.fatalIfSet("oidc.expiry", "node.expiry")
-
-	if viper.GetBool("oidc.enabled") {
-		err := validatePKCEMethod(viper.GetString("oidc.pkce.method"))
-		if err != nil {
-			return err
-		}
-	}
 
 	depr.Log()
 
@@ -573,9 +573,17 @@ func validateServerConfig() error {
 		errorText += "Fatal config error: the only supported values for tls_letsencrypt_challenge_type are HTTP-01 and TLS-ALPN-01\n"
 	}
 
-	if !strings.HasPrefix(viper.GetString("server_url"), "http://") &&
-		!strings.HasPrefix(viper.GetString("server_url"), "https://") {
-		errorText += "Fatal config error: server_url must start with https:// or http://\n"
+	serverURL := strings.TrimSpace(viper.GetString("server_url"))
+	if !AccountPasswordServerURLIsTrusted(serverURL) {
+		errorText += "Fatal config error: server_url must be an origin-only HTTPS URL (HTTP is allowed only for localhost or loopback IPs)\n"
+	}
+	if viper.GetBool("scaleforge.trust_proxy") {
+		trustedProxyCIDRs, err := configuredTrustedProxyCIDRs()
+		if err != nil {
+			errorText += fmt.Sprintf("Fatal config error: invalid scaleforge.trusted_proxy_cidrs: %v\n", err)
+		} else if len(trustedProxyCIDRs) == 0 {
+			errorText += "Fatal config error: scaleforge.trust_proxy requires at least one scaleforge.trusted_proxy_cidrs entry\n"
+		}
 	}
 
 	// Minimum inactivity time out is keepalive timeout (60s) plus a few seconds
@@ -646,6 +654,53 @@ func validateServerConfig() error {
 	}
 
 	return nil
+}
+
+// AccountPasswordServerURLIsTrusted validates the exact origin used by both
+// startup checks and the runtime password endpoint.
+func AccountPasswordServerURLIsTrusted(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" ||
+		parsed.ForceQuery || parsed.Fragment != "" ||
+		(parsed.Path != "" && parsed.Path != "/") {
+		return false
+	}
+	if strings.EqualFold(parsed.Scheme, "https") {
+		return true
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") {
+		return false
+	}
+
+	host := strings.TrimSpace(parsed.Hostname())
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	address, err := netip.ParseAddr(host)
+
+	return err == nil && address.IsLoopback()
+}
+
+func configuredTrustedProxyCIDRs() ([]netip.Prefix, error) {
+	values := viper.GetStringSlice("scaleforge.trusted_proxy_cidrs")
+	var entries []string
+	for _, value := range values {
+		entries = append(entries, strings.Split(value, ",")...)
+	}
+	prefixes := make([]netip.Prefix, 0, len(entries))
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", entry, err)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+
+	return prefixes, nil
 }
 
 func tlsConfig() TLSConfig {
@@ -962,6 +1017,11 @@ func dnsToTailcfgDNS(dns DNSConfig) *tailcfg.DNSConfig {
 	return &cfg
 }
 
+// Tailcfg converts the configured DNS policy into the client map format.
+func (d DNSConfig) Tailcfg() *tailcfg.DNSConfig {
+	return dnsToTailcfgDNS(d)
+}
+
 // warnBanner prints a highly visible warning banner to the log output.
 // It wraps the provided lines in an ASCII-art box with a "Warning!" header.
 // This is intended for critical configuration issues that users must not ignore.
@@ -1040,10 +1100,7 @@ func LoadCLIConfig() (*Config, error) {
 		DisableUpdateCheck: viper.GetBool("disable_check_updates"),
 		UnixSocket:         viper.GetString("unix_socket"),
 		CLI: CLIConfig{
-			Address:  viper.GetString("cli.address"),
-			APIKey:   viper.GetString("cli.api_key"),
-			Timeout:  viper.GetDuration("cli.timeout"),
-			Insecure: viper.GetBool("cli.insecure"),
+			Timeout: viper.GetDuration("cli.timeout"),
 		},
 		Log: logConfig,
 	}, nil
@@ -1122,23 +1179,11 @@ func LoadServerConfig() (*Config, error) {
 	logTailConfig := logtailConfig()
 	randomizeClientPort := viper.GetBool("randomize_client_port")
 
-	oidcClientSecret := viper.GetString("oidc.client_secret")
-
-	oidcClientSecretPath := viper.GetString("oidc.client_secret_path")
-	if oidcClientSecretPath != "" && oidcClientSecret != "" {
-		return nil, errOidcMutuallyExclusive
-	}
-
-	if oidcClientSecretPath != "" {
-		secretBytes, err := os.ReadFile(os.ExpandEnv(oidcClientSecretPath))
-		if err != nil {
-			return nil, err
-		}
-
-		oidcClientSecret = strings.TrimSpace(string(secretBytes))
-	}
-
 	serverURL := viper.GetString("server_url")
+	trustedProxyCIDRs, err := configuredTrustedProxyCIDRs()
+	if err != nil {
+		return nil, fmt.Errorf("parsing scaleforge.trusted_proxy_cidrs: %w", err)
+	}
 
 	// BaseDomain cannot be the same as the server URL.
 	// This is because Tailscale takes over the domain in BaseDomain,
@@ -1158,8 +1203,6 @@ func LoadServerConfig() (*Config, error) {
 		ServerURL:          serverURL,
 		Addr:               viper.GetString("listen_addr"),
 		MetricsAddr:        viper.GetString("metrics_listen_addr"),
-		GRPCAddr:           viper.GetString("grpc_listen_addr"),
-		GRPCAllowInsecure:  viper.GetBool("grpc_allow_insecure"),
 		DisableUpdateCheck: false,
 
 		PrefixV4:     prefix4,
@@ -1198,25 +1241,16 @@ func LoadServerConfig() (*Config, error) {
 
 		UnixSocket:           viper.GetString("unix_socket"),
 		UnixSocketPermission: util.GetFileMode("unix_socket_permission"),
-
-		OIDC: OIDCConfig{
-			OnlyStartIfOIDCIsAvailable: viper.GetBool(
-				"oidc.only_start_if_oidc_is_available",
-			),
-			Issuer:                viper.GetString("oidc.issuer"),
-			ClientID:              viper.GetString("oidc.client_id"),
-			ClientSecret:          oidcClientSecret,
-			Scope:                 viper.GetStringSlice("oidc.scope"),
-			ExtraParams:           viper.GetStringMapString("oidc.extra_params"),
-			AllowedDomains:        viper.GetStringSlice("oidc.allowed_domains"),
-			AllowedUsers:          viper.GetStringSlice("oidc.allowed_users"),
-			AllowedGroups:         viper.GetStringSlice("oidc.allowed_groups"),
-			EmailVerifiedRequired: viper.GetBool("oidc.email_verified_required"),
-			UseExpiryFromToken:    viper.GetBool("oidc.use_expiry_from_token"),
-			PKCE: PKCEConfig{
-				Enabled: viper.GetBool("oidc.pkce.enabled"),
-				Method:  viper.GetString("oidc.pkce.method"),
-			},
+		ScaleForge: ScaleForgeConfig{
+			Socket:                viper.GetString("scaleforge.socket"),
+			SocketPermission:      util.GetFileMode("scaleforge.socket_permission"),
+			BackendSocket:         viper.GetString("scaleforge.backend_socket"),
+			InternalAuthKeyFile:   viper.GetString("scaleforge.internal_auth_key_file"),
+			TrustProxy:            viper.GetBool("scaleforge.trust_proxy"),
+			TrustedProxyCIDRs:     trustedProxyCIDRs,
+			MaxNodesPerAccount:    viper.GetInt("scaleforge.max_nodes_per_account"),
+			BootstrapUsername:     viper.GetString("scaleforge.bootstrap_username"),
+			BootstrapPasswordFile: viper.GetString("scaleforge.bootstrap_password_file"),
 		},
 
 		LogTail:             logTailConfig,
@@ -1228,10 +1262,7 @@ func LoadServerConfig() (*Config, error) {
 		Policy: policyConfig(),
 
 		CLI: CLIConfig{
-			Address:  viper.GetString("cli.address"),
-			APIKey:   viper.GetString("cli.api_key"),
-			Timeout:  viper.GetDuration("cli.timeout"),
-			Insecure: viper.GetBool("cli.insecure"),
+			Timeout: viper.GetDuration("cli.timeout"),
 		},
 
 		Log: logConfig,

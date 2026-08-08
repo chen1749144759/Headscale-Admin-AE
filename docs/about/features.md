@@ -1,39 +1,29 @@
-# Features
+# 功能范围
 
-Headscale aims to implement a self-hosted, open source alternative to the Tailscale control server. Headscale's goal is
-to provide self-hosters and hobbyists with an open-source server they can use for their projects and labs. This page
-provides on overview of Headscale's feature and compatibility with the Tailscale control server:
+Headscale-Admin-AE 是 ScaleTail/ScaleForge 专用控制面，不承诺兼容官方 headscale 的
+全部认证和远程管理方式。
 
-- [x] Full "base" support of Tailscale's features
-- [x] [Node registration](../ref/registration.md)
-    - [x] [Web authentication](../ref/registration.md#web-authentication)
-    - [x] [Pre authenticated key](../ref/registration.md#pre-authenticated-key)
-- [x] [DNS](../ref/dns.md)
-    - [x] [MagicDNS](https://tailscale.com/docs/features/magicdns)
-    - [x] [Global and restricted nameservers (split DNS)](https://tailscale.com/docs/reference/dns-in-tailscale#nameservers)
-    - [x] [search domains](https://tailscale.com/docs/reference/dns-in-tailscale#search-domains)
-    - [x] [Extra DNS records (Headscale only)](../ref/dns.md#setting-extra-dns-records)
-- [x] [Taildrop (File Sharing)](https://tailscale.com/docs/features/taildrop)
-- [x] [Tags](../ref/tags.md)
-- [x] [Routes](../ref/routes.md)
-    - [x] [Subnet routers](../ref/routes.md#subnet-router)
-    - [x] [Exit nodes](../ref/routes.md#exit-node)
-- [x] Dual stack (IPv4 and IPv6)
-- [x] Ephemeral nodes
-- [x] Embedded [DERP server](../ref/derp.md)
-- [x] Access control lists ([GitHub label "policy"](https://github.com/juanfont/headscale/labels/policy%20%F0%9F%93%9D))
-    - [x] ACL management via API
-    - [x] Some [Autogroups](https://tailscale.com/docs/reference/targets-and-selectors#autogroups), currently:
-      `autogroup:internet`, `autogroup:nonroot`, `autogroup:member`, `autogroup:tagged`, `autogroup:self`,
-      `autogroup:danger-all`
-    - [x] [Auto approvers](https://tailscale.com/docs/reference/syntax/policy-file#auto-approvers) for [subnet
-      routers](../ref/routes.md#automatically-approve-routes-of-a-subnet-router) and [exit
-      nodes](../ref/routes.md#automatically-approve-an-exit-node-with-auto-approvers)
-    - [x] [Tailscale SSH](https://tailscale.com/docs/features/tailscale-ssh)
-- [x] [Node registration using Single-Sign-On (OpenID Connect)](../ref/oidc.md) ([GitHub label "OIDC"](https://github.com/juanfont/headscale/labels/OIDC))
-    - [x] Basic registration
-    - [x] Update user profile from identity provider
-    - [ ] OIDC groups cannot be used in ACLs
-- [ ] [Funnel](https://tailscale.com/docs/features/tailscale-funnel) ([#1040](https://github.com/juanfont/headscale/issues/1040))
-- [ ] [Serve](https://tailscale.com/docs/features/tailscale-serve) ([#1234](https://github.com/juanfont/headscale/issues/1921))
-- [ ] [Network flow logs](https://tailscale.com/docs/features/logging/network-flow-logs) ([#1687](https://github.com/juanfont/headscale/issues/1687))
+## 已支持
+
+- ScaleForge 账户名/密码统一身份。
+- 90 天密码有效期、账户禁用、账户到期和强制改密。
+- ScaleTail 在 TS2021 Noise 会话内完成节点账户证明。
+- PostgreSQL 与 SQLite 增量迁移。
+- ACL、MagicDNS、子网路由、出口节点和网络地图。
+- ScaleForge 私有 Unix socket 管理边界。
+- 客户端上报、策略领取和更新检查的私有 socket 转发。
+- 内置 DERP、STUN 与已注册客户端校验。
+- 节点数量限制、注册并发保护和旧认证节点到期迁移。
+
+## 明确不支持
+
+- 预认证 Key / auth key。
+- Headscale API Key。
+- OIDC 与浏览器授权。
+- Auth ID 手工注册/批准。
+- 公网 REST 管理 API、Swagger 和远程 gRPC 管理。
+- 账户认证节点的身份标签。
+- 未实现 ScaleTail 账户协议的官方 Android、Apple 或 Windows 客户端。
+
+历史数据库表、Go 类型和 protobuf 定义可能仍包含旧功能名称，它们只用于迁移和结构
+兼容，不是可调用的产品能力。

@@ -16,8 +16,8 @@ import (
 // Combined with the bounded-LRU cache that holds these entries, this caps
 // the worst-case memory footprint of unauthenticated cache-fill attempts
 // at (max_entries × per_entry_size). The cache is sized so that the
-// product is bounded to a few MiB even with attacker-supplied 1 MiB
-// Hostinfos (the Noise body limit).
+// product is bounded to a few MiB. The producer stores a fixed-size Hostinfo
+// projection instead of retaining the attacker-controlled request object.
 type RegistrationData struct {
 	// MachineKey is the cryptographic identity of the machine being
 	// registered. Required.
@@ -34,11 +34,8 @@ type RegistrationData struct {
 	// Already validated/normalised by EnsureHostname at producer time.
 	Hostname string
 
-	// Hostinfo is the original Hostinfo from the RegisterRequest,
-	// stored so that the auth callback can populate the new node's
-	// initial Hostinfo (and so that observability/CLI consumers see
-	// fields like OS, OSVersion, and IPNVersion before the first
-	// MapRequest restores the live set).
+	// Hostinfo is a bounded metadata projection from the RegisterRequest.
+	// Large and live-only fields are restored by the first MapRequest.
 	//
 	// May be nil if the client did not send Hostinfo in the original
 	// RegisterRequest.

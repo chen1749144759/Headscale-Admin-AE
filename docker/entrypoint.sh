@@ -1,55 +1,57 @@
 #!/bin/sh
-set -e
+set -eu
 
-CONFIG_TMPL="/etc/headscale/config.yaml.tmpl"
-CONFIG_OUT="/etc/headscale/config.yaml"
-API_KEY_FILE="/var/lib/headscale/api.key"
+config_template="/etc/headscale/config.yaml.tmpl"
+config_output="${HEADSCALE_CONFIG_OUT:-/var/lib/headscale-config/config.yaml}"
 
-# 1. 如果有配置模板且有环境变量，用 envsubst 渲染
-if [ -f "$CONFIG_TMPL" ] && [ -n "$HEADSCALE_SERVER_URL" ]; then
-  echo "[entrypoint] Rendering config from template..."
-  envsubst < "$CONFIG_TMPL" > "$CONFIG_OUT"
-  echo "[entrypoint] Config generated at $CONFIG_OUT"
+render_yaml_list() {
+  input="$1"
+  fallback="$2"
+  if [ -z "$input" ]; then input="$fallback"; fi
+  printf '%s' "$input" | awk -v RS='[,;]' '
+    {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      if ($0 != "") printf "      - %s\n", $0
+    }
+  '
+}
+
+HEADSCALE_MAGIC_DNS="${HEADSCALE_MAGIC_DNS:-true}"
+HEADSCALE_DNS_OVERRIDE_LOCAL="${HEADSCALE_DNS_OVERRIDE_LOCAL:-true}"
+HEADSCALE_DNS_GLOBAL_YAML="$(render_yaml_list "${HEADSCALE_DNS_GLOBAL:-}" "1.1.1.1,8.8.8.8")"
+HEADSCALE_DNS_SEARCH_YAML=""
+if [ -n "${HEADSCALE_DNS_SEARCH_DOMAINS:-}" ]; then
+  HEADSCALE_DNS_SEARCH_YAML="  search_domains:
+$(render_yaml_list "$HEADSCALE_DNS_SEARCH_DOMAINS" "")"
 fi
+export HEADSCALE_MAGIC_DNS HEADSCALE_DNS_OVERRIDE_LOCAL
+export HEADSCALE_DNS_GLOBAL_YAML HEADSCALE_DNS_SEARCH_YAML
 
-# 如果没有渲染出配置文件且也没有手动挂载的配置，则无法启动
-if [ ! -f "$CONFIG_OUT" ]; then
-  echo "[entrypoint] ERROR: No config.yaml found at $CONFIG_OUT"
-  echo "[entrypoint] Either mount a config.yaml or set environment variables for template rendering."
-  exit 1
-fi
-
-# 2. 后台启动 headscale
-headscale serve -c "$CONFIG_OUT" &
-HS_PID=$!
-
-# 3. 等待 headscale 就绪
-echo "[entrypoint] Waiting for headscale to be ready..."
-for i in $(seq 1 30); do
-  if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
-    echo "[entrypoint] Headscale is ready."
-    break
+for socket_dir in \
+  /var/run/scaleforge \
+  /var/run/scaleforge/control \
+  /var/run/scaleforge/client
+do
+  if [ -L "$socket_dir" ]; then
+    echo "[entrypoint] refusing symbolic-link socket directory: $socket_dir" >&2
+    exit 1
   fi
-  if [ "$i" -eq 30 ]; then
-    echo "[entrypoint] WARNING: headscale health check timeout, continuing anyway..."
-  fi
-  sleep 1
 done
 
-# 4. 自动创建 API Key（仅首次，文件不存在时）
-if [ ! -f "$API_KEY_FILE" ]; then
-  echo "[entrypoint] Creating initial API key..."
-  API_KEY=$(headscale -c "$CONFIG_OUT" apikey create 2>/dev/null || true)
-  if [ -n "$API_KEY" ]; then
-    echo "$API_KEY" > "$API_KEY_FILE"
-    echo "[entrypoint] API key created and saved to $API_KEY_FILE"
-  else
-    echo "[entrypoint] WARNING: Failed to create API key, you may need to create it manually:"
-    echo "  docker exec <container> headscale apikey create"
-  fi
-else
-  echo "[entrypoint] API key file already exists, skipping creation."
-fi
+install -d -m 0750 -o headscale -g headscale /var/lib/headscale "$(dirname "$config_output")"
+install -d -m 0770 -o headscale -g headscale /var/run/headscale
+install -d -m 2750 -o headscale -g scaleforge /var/run/scaleforge/control
+install -d -m 2750 -o headscale -g scaleforge /var/run/scaleforge/client
 
-# 5. 前台等待 headscale 进程
-wait $HS_PID
+temporary_config="${config_output}.tmp"
+envsubst < "$config_template" > "$temporary_config"
+if ! grep -q '^scaleforge:' "$temporary_config"; then
+  echo "[entrypoint] rendered config has no scaleforge section" >&2
+  rm -f "$temporary_config"
+  exit 1
+fi
+chown headscale:headscale "$temporary_config"
+chmod 0600 "$temporary_config"
+mv -f "$temporary_config" "$config_output"
+
+exec gosu headscale headscale serve -c "$config_output"

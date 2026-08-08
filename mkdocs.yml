@@ -84,10 +84,9 @@ plugins:
         exit-node.md: ref/routes.md
         faq.md: about/faq.md
         iOS-client.md: usage/connect/apple.md#ios
-        oidc.md: ref/oidc.md
         ref/exit-node.md: ref/routes.md
-        ref/remote-cli.md: ref/api.md#grpc
-        remote-cli.md: ref/api.md#grpc
+        ref/remote-cli.md: ref/api.md
+        remote-cli.md: ref/api.md
         reverse-proxy.md: ref/integration/reverse-proxy.md
         tls.md: ref/tls.md
         web-ui.md: ref/integration/web-ui.md
@@ -181,13 +180,12 @@ nav:
   - Reference:
       - Configuration: ref/configuration.md
       - Registration methods: ref/registration.md
-      - OpenID Connect: ref/oidc.md
       - Routes: ref/routes.md
       - TLS: ref/tls.md
       - ACLs: ref/acls.md
       - DNS: ref/dns.md
       - DERP: ref/derp.md
-      - API: ref/api.md
+      - Private API: ref/api.md
       - Tags: ref/tags.md
       - Debug: ref/debug.md
       - Integration:

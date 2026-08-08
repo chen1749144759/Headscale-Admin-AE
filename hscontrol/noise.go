@@ -7,15 +7,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"net/url"
+	"net/netip"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/metrics"
 	"github.com/juanfont/headscale/hscontrol/capver"
+	hsdb "github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/net/http2"
@@ -34,9 +40,6 @@ var ErrMissingURLParameter = errors.New("missing URL parameter")
 // ErrUnsupportedURLParameterType is returned when a URL parameter has an unsupported type.
 var ErrUnsupportedURLParameterType = errors.New("unsupported URL parameter type")
 
-// ErrNoAuthSession is returned when an auth_id does not match any active auth session.
-var ErrNoAuthSession = errors.New("no auth session found")
-
 // ErrSSHDstNodeNotFound is returned when the dst node id on a Noise SSH
 // action request does not match any registered node.
 var ErrSSHDstNodeNotFound = errors.New("ssh action: unknown dst node id")
@@ -45,18 +48,6 @@ var ErrSSHDstNodeNotFound = errors.New("ssh action: unknown dst node id")
 // key does not match the dst node referenced in the SSH action URL.
 var ErrSSHMachineKeyMismatch = errors.New(
 	"ssh action: noise session machine key does not match dst node",
-)
-
-// ErrSSHAuthSessionNotBound is returned when an SSH action follow-up
-// references an auth session that is not bound to an SSH check pair.
-var ErrSSHAuthSessionNotBound = errors.New(
-	"ssh action: cached auth session is not an SSH-check binding",
-)
-
-// ErrSSHBindingMismatch is returned when an SSH action follow-up's
-// (src, dst) pair does not match the cached binding for its auth_id.
-var ErrSSHBindingMismatch = errors.New(
-	"ssh action: cached binding does not match request src/dst",
 )
 
 const (
@@ -74,7 +65,10 @@ const (
 	// handlers. This prevents unauthenticated OOM attacks via unbounded io.ReadAll.
 	// No legitimate Noise request (MapRequest, RegisterRequest, etc.) comes close
 	// to this limit; typical payloads are a few KB.
-	noiseBodyLimit int64 = 1048576 // 1 MiB
+	noiseBodyLimit int64 = 262144 // 256 KiB
+
+	accountUsernameHeader = "X-ScaleTail-Account"
+	accountPasswordHeader = "X-ScaleTail-Password"
 )
 
 type noiseServer struct {
@@ -89,6 +83,14 @@ type noiseServer struct {
 	// EarlyNoise-related stuff
 	challenge       key.ChallengePrivate
 	protocolVersion int
+	authSource      string
+
+	accountAuthMu      sync.Mutex
+	accountAuthNodeKey key.NodePublic
+	accountAuthUserID  types.UserID
+	accountAuthID      uint
+	accountAuthVersion uint64
+	accountAuthExpiry  time.Time
 }
 
 // NoiseUpgradeHandler is to upgrade the connection and hijack the net.Conn
@@ -113,8 +115,9 @@ func (h *Headscale) NoiseUpgradeHandler(
 	}
 
 	ns := noiseServer{
-		headscale: h,
-		challenge: key.NewChallenge(),
+		headscale:  h,
+		challenge:  key.NewChallenge(),
+		authSource: noiseAuthSource(req, h.cfg.ScaleForge.TrustedProxyCIDRs),
 	}
 
 	noiseConn, err := controlhttpserver.AcceptHTTP(
@@ -158,15 +161,17 @@ func (h *Headscale) NoiseUpgradeHandler(
 		},
 	}))
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
 	r.Use(middleware.RequestLogger(&zerologRequestLogger{}))
 	r.Use(middleware.Recoverer)
 
-	r.Handle("/metrics", metrics.Handler())
-
 	r.Route("/machine", func(r chi.Router) {
 		r.Post("/register", ns.RegistrationHandler)
+		r.Post("/auth/password", ns.PasswordAuthHandler)
 		r.Post("/map", ns.PollNetMapHandler)
+		r.Get("/scaleforge/client-update", ns.ScaleForgeClientHandler)
+		r.Post("/scaleforge/traffic", ns.ScaleForgeClientHandler)
+		r.Get("/scaleforge/policy", ns.ScaleForgeClientHandler)
+		r.Post("/scaleforge/policy-state", ns.ScaleForgeClientHandler)
 
 		// SSH Check mode endpoint, consulted to validate if a given SSH connection should be accepted or rejected.
 		r.Get("/ssh/action/{src_node_id}/to/{dst_node_id}", ns.SSHActionHandler)
@@ -389,9 +394,8 @@ func (ns *noiseServer) SSHActionHandler(
 	// tailscaled instance asking us whether to permit an incoming SSH
 	// connection, so its Noise session must belong to dst. Without this
 	// check any unauthenticated client could open a Noise tunnel with a
-	// throwaway machine key and pollute lastSSHAuth for arbitrary
-	// (src, dst) pairs, defeating SSH check-mode's stolen-key
-	// protections.
+	// throwaway machine key and ask for policy decisions about arbitrary
+	// (src, dst) pairs.
 	dstNode, ok := ns.headscale.state.GetNodeByID(dstNodeID)
 	if !ok {
 		httpError(writer, NewHTTPError(
@@ -411,6 +415,15 @@ func (ns *noiseServer) SSHActionHandler(
 				"%w: machine key %s, dst node %d",
 				ErrSSHMachineKeyMismatch, ns.machineKey.ShortString(), dstNodeID,
 			),
+		))
+
+		return
+	}
+	if !ns.hasAccountProof(dstNode.NodeKey(), dstNode.TypedUserID()) {
+		httpError(writer, NewHTTPError(
+			http.StatusUnauthorized,
+			"account password proof required for this Noise session",
+			nil,
 		))
 
 		return
@@ -452,217 +465,28 @@ func (ns *noiseServer) SSHActionHandler(
 	}
 }
 
-// sshAction resolves the SSH action for the given request parameters.
-// It returns the action to send to the client, or an HTTPError on failure.
-//
-// Three cases:
-//  1. Initial request, auto-approved — source recently authenticated
-//     within the check period, accept immediately.
-//  2. Initial request, needs auth — build a HoldAndDelegate URL and
-//     wait for the user to authenticate.
-//  3. Follow-up request — an auth_id is present, wait for the auth
-//     verdict and accept or reject.
+// sshAction rejects policy check mode explicitly. ScaleTail has no separate
+// browser approval identity. Treating a control-session password proof as an
+// SSH step-up would erase the distinction between "accept" and "check".
 func (ns *noiseServer) sshAction(
-	ctx context.Context,
+	_ context.Context,
 	reqLog zerolog.Logger,
 	srcNodeID, dstNodeID types.NodeID,
-	authIDStr string,
+	_ string,
 ) (*tailcfg.SSHAction, error) {
 	action := tailcfg.SSHAction{
+		Reject:                    true,
 		AllowAgentForwarding:      true,
 		AllowLocalPortForwarding:  true,
 		AllowRemotePortForwarding: true,
+		Message:                   "ScaleTail SSH check mode is unavailable in account-password mode; use an explicit accept rule.",
 	}
+	reqLog.Warn().
+		Uint64("src_node_id", srcNodeID.Uint64()).
+		Uint64("dst_node_id", dstNodeID.Uint64()).
+		Msg("rejected unsupported SSH check-mode request")
 
-	// Look up check params from the server's own policy rather than
-	// trusting URL parameters, which the client could tamper with.
-	checkPeriod, checkFound := ns.headscale.state.SSHCheckParams(
-		srcNodeID, dstNodeID,
-	)
-
-	// Follow-up request with auth_id — wait for the auth verdict.
-	if authIDStr != "" {
-		return ns.sshActionFollowUp(
-			ctx, reqLog, &action, authIDStr,
-			srcNodeID, dstNodeID,
-			checkFound,
-		)
-	}
-
-	// Initial request — check if auto-approval applies.
-	if checkFound && checkPeriod > 0 {
-		if lastAuth, ok := ns.headscale.state.GetLastSSHAuth(
-			srcNodeID, dstNodeID,
-		); ok && time.Since(lastAuth) < checkPeriod {
-			reqLog.Trace().Caller().
-				Dur("check_period", checkPeriod).
-				Time("last_auth", lastAuth).
-				Msg("auto-approved within check period")
-
-			action.Accept = true
-
-			return &action, nil
-		}
-	}
-
-	// No auto-approval — create an auth session and hold.
-	return ns.sshActionHoldAndDelegate(reqLog, &action, srcNodeID, dstNodeID)
-}
-
-// sshActionHoldAndDelegate creates a new auth session bound to the
-// (src, dst) pair and returns a HoldAndDelegate action that directs the
-// client to authenticate.
-func (ns *noiseServer) sshActionHoldAndDelegate(
-	reqLog zerolog.Logger,
-	action *tailcfg.SSHAction,
-	srcNodeID, dstNodeID types.NodeID,
-) (*tailcfg.SSHAction, error) {
-	holdURL, err := url.Parse(
-		ns.headscale.cfg.ServerURL +
-			"/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID" +
-			"?local_user=$LOCAL_USER",
-	)
-	if err != nil {
-		return nil, NewHTTPError(
-			http.StatusInternalServerError,
-			"Internal error",
-			fmt.Errorf("parsing SSH action URL: %w", err),
-		)
-	}
-
-	authID, err := types.NewAuthID()
-	if err != nil {
-		return nil, NewHTTPError(
-			http.StatusInternalServerError,
-			"Internal error",
-			fmt.Errorf("generating auth ID: %w", err),
-		)
-	}
-
-	ns.headscale.state.SetAuthCacheEntry(
-		authID,
-		types.NewSSHCheckAuthRequest(srcNodeID, dstNodeID),
-	)
-
-	authURL := ns.headscale.authProvider.AuthURL(authID)
-
-	q := holdURL.Query()
-	q.Set("auth_id", authID.String())
-	holdURL.RawQuery = q.Encode()
-
-	action.HoldAndDelegate = holdURL.String()
-
-	// TODO(kradalby): here we can also send a very tiny mapresponse
-	// "popping" the url and opening it for the user.
-	action.Message = fmt.Sprintf(
-		"# Headscale SSH requires an additional check.\n"+
-			"# To authenticate, visit: %s\n"+
-			"# Authentication checked with Headscale SSH.\n",
-		authURL,
-	)
-
-	reqLog.Info().Caller().
-		Str("auth_id", authID.String()).
-		Msg("SSH check pending, waiting for auth")
-
-	return action, nil
-}
-
-// sshActionFollowUp handles follow-up requests where the client
-// provides an auth_id. It blocks until the auth session resolves or
-// the request context is cancelled (e.g. the client disconnects).
-func (ns *noiseServer) sshActionFollowUp(
-	ctx context.Context,
-	reqLog zerolog.Logger,
-	action *tailcfg.SSHAction,
-	authIDStr string,
-	srcNodeID, dstNodeID types.NodeID,
-	checkFound bool,
-) (*tailcfg.SSHAction, error) {
-	authID, err := types.AuthIDFromString(authIDStr)
-	if err != nil {
-		return nil, NewHTTPError(
-			http.StatusBadRequest,
-			"Invalid auth_id",
-			fmt.Errorf("parsing auth_id: %w", err),
-		)
-	}
-
-	reqLog = reqLog.With().Str("auth_id", authID.String()).Logger()
-
-	auth, ok := ns.headscale.state.GetAuthCacheEntry(authID)
-	if !ok {
-		return nil, NewHTTPError(
-			http.StatusBadRequest,
-			"Invalid auth_id",
-			fmt.Errorf("%w: %s", ErrNoAuthSession, authID),
-		)
-	}
-
-	// Verify the cached binding matches the (src, dst) pair the
-	// follow-up URL claims. Without this check an attacker who knew an
-	// auth_id could submit a follow-up for any other (src, dst) pair
-	// and have its verdict recorded against that pair instead.
-	if !auth.IsSSHCheck() {
-		return nil, NewHTTPError(
-			http.StatusBadRequest,
-			"auth session is not for SSH check",
-			fmt.Errorf("%w: %s", ErrSSHAuthSessionNotBound, authID),
-		)
-	}
-
-	binding := auth.SSHCheckBinding()
-	if binding.SrcNodeID != srcNodeID || binding.DstNodeID != dstNodeID {
-		return nil, NewHTTPError(
-			http.StatusUnauthorized,
-			"src/dst pair does not match auth session",
-			fmt.Errorf(
-				"%w: cached %d->%d, request %d->%d",
-				ErrSSHBindingMismatch,
-				binding.SrcNodeID, binding.DstNodeID,
-				srcNodeID, dstNodeID,
-			),
-		)
-	}
-
-	reqLog.Trace().Caller().Msg("SSH action follow-up")
-
-	var verdict types.AuthVerdict
-	select {
-	case <-ctx.Done():
-		// The client disconnected (or its request timed out) before the
-		// auth session resolved. Return an error so the parked goroutine
-		// is freed; without this select sshActionFollowUp would block
-		// until the cache eviction callback signalled FinishAuth, which
-		// could be up to register_cache_expiration (15 minutes).
-		return nil, NewHTTPError(
-			http.StatusUnauthorized,
-			"ssh action follow-up cancelled",
-			ctx.Err(),
-		)
-	case verdict = <-auth.WaitForAuth():
-	}
-
-	if !verdict.Accept() {
-		action.Reject = true
-
-		reqLog.Trace().Caller().Err(verdict.Err).
-			Msg("authentication rejected")
-
-		return action, nil
-	}
-
-	action.Accept = true
-
-	// Record the successful auth for future auto-approval.
-	if checkFound {
-		ns.headscale.state.SetLastSSHAuth(srcNodeID, dstNodeID)
-
-		reqLog.Trace().Caller().
-			Msg("auth recorded for auto-approval")
-	}
-
-	return action, nil
+	return &action, nil
 }
 
 // PollNetMapHandler takes care of /machine/:id/map using the Noise protocol
@@ -696,6 +520,10 @@ func (ns *noiseServer) PollNetMapHandler(
 		httpError(writer, err)
 		return
 	}
+	if err := ns.requireMapAccountProof(req, nv); err != nil {
+		httpError(writer, err)
+		return
+	}
 
 	ns.nodeKey = nv.NodeKey()
 
@@ -711,6 +539,400 @@ func (ns *noiseServer) PollNetMapHandler(
 
 func regErr(err error) *tailcfg.RegisterResponse {
 	return &tailcfg.RegisterResponse{Error: err.Error()}
+}
+
+type passwordAuthRequest struct {
+	AuthID   string `json:"authId"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type passwordAuthResponse struct {
+	Status  string `json:"status,omitempty"`
+	Code    string `json:"code,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Warning string `json:"warning,omitempty"`
+}
+
+const passwordAuthRequestBodyLimit = 8 << 10
+
+func writePasswordAuthResponse(
+	writer http.ResponseWriter,
+	status int,
+	response passwordAuthResponse,
+) {
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.Header().Set("Cache-Control", "no-store")
+	writer.WriteHeader(status)
+	if err := json.NewEncoder(writer).Encode(response); err != nil {
+		log.Error().Err(err).Msg("failed to encode password authentication response")
+	}
+}
+
+func passwordAuthServerURLIsTrusted(serverURL string) bool {
+	return types.AccountPasswordServerURLIsTrusted(serverURL)
+}
+
+func trustedProxyAddress(address netip.Addr, prefixes []netip.Prefix) bool {
+	address = address.Unmap()
+	for _, prefix := range prefixes {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func noiseAuthSource(req *http.Request, trustedProxyCIDRs []netip.Prefix) string {
+	direct := passwordAuthSource(req.RemoteAddr)
+	directAddress, err := netip.ParseAddr(direct)
+	if err != nil || !trustedProxyAddress(directAddress, trustedProxyCIDRs) {
+		return direct
+	}
+
+	if value := strings.TrimSpace(req.Header.Get("X-Real-IP")); value != "" {
+		if ip := net.ParseIP(value); ip != nil {
+			return ip.String()
+		}
+	}
+
+	forwarded := strings.Split(req.Header.Get("X-Forwarded-For"), ",")
+	for idx := len(forwarded) - 1; idx >= 0; idx-- {
+		if address, err := netip.ParseAddr(strings.TrimSpace(forwarded[idx])); err == nil {
+			if !trustedProxyAddress(address, trustedProxyCIDRs) {
+				return address.Unmap().String()
+			}
+		}
+	}
+
+	return direct
+}
+
+// PasswordAuthHandler authenticates a pending registration using the single
+// account credential. It is only reachable inside the machine's Noise session;
+// the auth ID is additionally bound to that session's machine key.
+func (ns *noiseServer) PasswordAuthHandler(writer http.ResponseWriter, req *http.Request) {
+	if !passwordAuthServerURLIsTrusted(ns.headscale.cfg.ServerURL) {
+		writePasswordAuthResponse(writer, http.StatusUpgradeRequired, passwordAuthResponse{
+			Code:  "https_required",
+			Error: "password authentication requires a trusted HTTPS control server",
+		})
+		return
+	}
+
+	req.Body = http.MaxBytesReader(writer, req.Body, passwordAuthRequestBodyLimit)
+	decoder := json.NewDecoder(req.Body)
+	decoder.DisallowUnknownFields()
+	var authReq passwordAuthRequest
+	if err := decoder.Decode(&authReq); err != nil {
+		writePasswordAuthResponse(writer, http.StatusBadRequest, passwordAuthResponse{
+			Code:  "invalid_request",
+			Error: "invalid password authentication request",
+		})
+		return
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		writePasswordAuthResponse(writer, http.StatusBadRequest, passwordAuthResponse{
+			Code:  "invalid_request",
+			Error: "authentication request must contain one JSON value",
+		})
+		return
+	}
+
+	if strings.TrimSpace(authReq.Username) == "" || authReq.Password == "" ||
+		len(authReq.Username) > 255 || len([]byte(authReq.Password)) > 72 {
+		writePasswordAuthResponse(writer, http.StatusBadRequest, passwordAuthResponse{
+			Code:  "invalid_request",
+			Error: "invalid username or password length",
+		})
+		return
+	}
+	if authReq.AuthID == "" {
+		ns.reauthenticateExistingNode(req.Context(), writer, authReq)
+		return
+	}
+
+	authID, err := types.AuthIDFromString(authReq.AuthID)
+	if err != nil {
+		writePasswordAuthResponse(writer, http.StatusBadRequest, passwordAuthResponse{
+			Code:  "invalid_auth_session",
+			Error: "invalid registration session",
+		})
+		return
+	}
+
+	entry, ok := ns.headscale.state.GetAuthCacheEntry(authID)
+	if !ok {
+		writePasswordAuthResponse(writer, http.StatusNotFound, passwordAuthResponse{
+			Code:  "auth_session_expired",
+			Error: "registration session has expired",
+		})
+		return
+	}
+	regData, ok := entry.RegistrationDataOK()
+	if !ok {
+		writePasswordAuthResponse(writer, http.StatusBadRequest, passwordAuthResponse{
+			Code:  "invalid_auth_session",
+			Error: "authentication session is not a node registration",
+		})
+		return
+	}
+	if regData.MachineKey != ns.machineKey {
+		writePasswordAuthResponse(writer, http.StatusUnauthorized, passwordAuthResponse{
+			Code:  "machine_mismatch",
+			Error: "registration session belongs to another machine",
+		})
+		return
+	}
+	if regData.Hostinfo != nil && len(regData.Hostinfo.RequestTags) > 0 {
+		writePasswordAuthResponse(writer, http.StatusBadRequest, passwordAuthResponse{
+			Code:  "tags_not_supported",
+			Error: "account-authenticated nodes cannot use identity tags",
+		})
+		return
+	}
+
+	now := time.Now().UTC()
+	account, err := ns.authenticateAccount(
+		req.Context(),
+		authReq.Username,
+		authReq.Password,
+		now,
+	)
+	if err != nil {
+		status, code, message := passwordAuthFailure(err)
+		writePasswordAuthResponse(writer, status, passwordAuthResponse{Code: code, Error: message})
+		return
+	}
+	if account == nil || account.UserID == nil {
+		writePasswordAuthResponse(writer, http.StatusForbidden, passwordAuthResponse{
+			Code:  "network_not_assigned",
+			Error: "account is not assigned to a network",
+		})
+		return
+	}
+	account, unlockAccount, err := ns.headscale.state.BeginAccountAuthentication(
+		account.ID,
+		account.PasswordVersion,
+		now,
+	)
+	if err != nil {
+		status, code, message := passwordAuthFailure(err)
+		writePasswordAuthResponse(writer, status, passwordAuthResponse{Code: code, Error: message})
+		return
+	}
+	defer unlockAccount()
+
+	nodeExpiry := account.PasswordChangedAt.Add(types.AccountPasswordMaxAge)
+	if account.ExpiresAt != nil && account.ExpiresAt.Before(nodeExpiry) {
+		nodeExpiry = *account.ExpiresAt
+	}
+
+	node, nodeChange, err := ns.headscale.state.HandleNodeFromAuthPath(
+		authID,
+		types.UserID(*account.UserID),
+		&nodeExpiry,
+		util.RegisterMethodPassword,
+	)
+	if err != nil {
+		status, code, message := http.StatusInternalServerError, "registration_failed", "node registration failed"
+		switch {
+		case errors.Is(err, state.ErrAuthRequestAlreadyClaimed):
+			status, code, message = http.StatusConflict, "auth_session_consumed", "registration session was already used"
+		case errors.Is(err, state.ErrAuthRequestNotRegistration):
+			status, code, message = http.StatusBadRequest, "invalid_auth_session", "authentication session is not a node registration"
+		case errors.Is(err, state.ErrAccountNodeLimitReached):
+			status, code, message = http.StatusConflict, "node_limit_reached", "this account has reached its node limit"
+		case errors.Is(err, hsdb.ErrNodeNotFoundRegistrationCache):
+			status, code, message = http.StatusNotFound, "auth_session_expired", "registration session has expired"
+		default:
+			log.Error().Err(err).Msg("registering password-authenticated node")
+		}
+
+		writePasswordAuthResponse(writer, status, passwordAuthResponse{Code: code, Error: message})
+		return
+	}
+
+	routesChange, err := ns.headscale.state.AutoApproveRoutes(node)
+	if err != nil {
+		ns.headscale.Change(nodeChange)
+		log.Error().Err(err).Msg("auto approving routes for password-authenticated node")
+		ns.rememberAccountProof(account, node.NodeKey(), types.UserID(*account.UserID))
+		writePasswordAuthResponse(writer, http.StatusOK, passwordAuthResponse{
+			Status:  "authenticated",
+			Warning: "node connected but automatic route approval failed",
+		})
+		return
+	}
+
+	ns.headscale.Change(nodeChange, routesChange)
+	ns.rememberAccountProof(account, node.NodeKey(), types.UserID(*account.UserID))
+	writePasswordAuthResponse(writer, http.StatusOK, passwordAuthResponse{Status: "authenticated"})
+}
+
+func accountNodeExpiry(account *types.Account) time.Time {
+	expiry := account.PasswordChangedAt.Add(types.AccountPasswordMaxAge)
+	if account.ExpiresAt != nil && account.ExpiresAt.Before(expiry) {
+		expiry = *account.ExpiresAt
+	}
+	return expiry
+}
+
+func passwordAuthFailure(err error) (int, string, string) {
+	status, code, message := http.StatusUnauthorized, "invalid_credentials", "invalid username or password"
+	switch {
+	case errors.Is(err, errPasswordAuthRateLimited):
+		status, code, message = http.StatusTooManyRequests, "too_many_attempts", "too many authentication attempts"
+	case errors.Is(err, hsdb.ErrAccountDisabled):
+		status, code, message = http.StatusForbidden, "account_disabled", "account is disabled"
+	case errors.Is(err, hsdb.ErrAccountExpired):
+		status, code, message = http.StatusForbidden, "account_expired", "account is expired"
+	case errors.Is(err, hsdb.ErrAccountPasswordExpired):
+		status, code, message = http.StatusForbidden, "password_expired", "password must be changed"
+	case errors.Is(err, hsdb.ErrAccountConcurrentUpdate):
+		status, code, message = http.StatusConflict, "account_changed", "account changed during authentication; retry"
+	case !errors.Is(err, hsdb.ErrAccountInvalidCredentials):
+		log.Error().Err(err).Msg("password authentication failed")
+		status, code, message = http.StatusInternalServerError, "internal_error", "authentication failed"
+	}
+	return status, code, message
+}
+
+func (ns *noiseServer) reauthenticateExistingNode(
+	ctx context.Context,
+	writer http.ResponseWriter,
+	authReq passwordAuthRequest,
+) {
+	now := time.Now().UTC()
+	account, err := ns.authenticateAccount(ctx, authReq.Username, authReq.Password, now)
+	if err != nil {
+		status, code, message := passwordAuthFailure(err)
+		writePasswordAuthResponse(writer, status, passwordAuthResponse{Code: code, Error: message})
+		return
+	}
+	if account == nil || account.UserID == nil {
+		writePasswordAuthResponse(writer, http.StatusForbidden, passwordAuthResponse{
+			Code: "network_not_assigned", Error: "account is not assigned to a network",
+		})
+		return
+	}
+	account, unlockAccount, err := ns.headscale.state.BeginAccountAuthentication(
+		account.ID,
+		account.PasswordVersion,
+		now,
+	)
+	if err != nil {
+		status, code, message := passwordAuthFailure(err)
+		writePasswordAuthResponse(writer, status, passwordAuthResponse{Code: code, Error: message})
+		return
+	}
+	defer unlockAccount()
+	node, ok := ns.headscale.state.GetNodeByMachineKey(ns.machineKey, types.UserID(*account.UserID))
+	if !ok || node.IsTagged() || node.RegisterMethod() != util.RegisterMethodPassword {
+		writePasswordAuthResponse(writer, http.StatusNotFound, passwordAuthResponse{
+			Code: "auth_session_expired", Error: "device must complete account registration",
+		})
+		return
+	}
+	expiry := accountNodeExpiry(account)
+	updated, nodeChange, err := ns.headscale.state.SetNodeExpiry(node.ID(), &expiry)
+	if err != nil {
+		writePasswordAuthResponse(writer, http.StatusInternalServerError, passwordAuthResponse{
+			Code: "internal_error", Error: "failed to renew device authentication",
+		})
+		return
+	}
+	ns.headscale.Change(nodeChange)
+	ns.rememberAccountProof(account, updated.NodeKey(), types.UserID(*account.UserID))
+	writePasswordAuthResponse(writer, http.StatusOK, passwordAuthResponse{Status: "authenticated"})
+}
+
+func (ns *noiseServer) rememberAccountProof(
+	account *types.Account,
+	nodeKey key.NodePublic,
+	userID types.UserID,
+) {
+	if account == nil {
+		return
+	}
+	ns.accountAuthMu.Lock()
+	defer ns.accountAuthMu.Unlock()
+	ns.accountAuthNodeKey = nodeKey
+	ns.accountAuthUserID = userID
+	ns.accountAuthID = account.ID
+	ns.accountAuthVersion = account.PasswordVersion
+	ns.accountAuthExpiry = accountNodeExpiry(account)
+}
+
+func (ns *noiseServer) hasAccountProof(nodeKey key.NodePublic, userID types.UserID) bool {
+	if nodeKey.IsZero() || userID == 0 {
+		return false
+	}
+	ns.accountAuthMu.Lock()
+	proofNodeKey := ns.accountAuthNodeKey
+	proofUserID := ns.accountAuthUserID
+	proofAccountID := ns.accountAuthID
+	proofVersion := ns.accountAuthVersion
+	proofExpiry := ns.accountAuthExpiry
+	ns.accountAuthMu.Unlock()
+
+	now := time.Now().UTC()
+	if proofNodeKey != nodeKey || proofUserID != userID || proofAccountID == 0 ||
+		proofVersion == 0 || !proofExpiry.After(now) {
+		return false
+	}
+	account, err := ns.headscale.state.GetAccountByID(proofAccountID)
+	if err != nil || account == nil || !account.Enabled || account.PasswordExpired(now) ||
+		account.PasswordVersion != proofVersion || account.UserID == nil ||
+		types.UserID(*account.UserID) != proofUserID {
+		return false
+	}
+	if account.ExpiresAt != nil && !account.ExpiresAt.After(now) {
+		return false
+	}
+
+	return true
+}
+
+func (ns *noiseServer) requireMapAccountProof(req *http.Request, node types.NodeView) error {
+	userID := node.TypedUserID()
+	if userID == 0 || node.IsTagged() || node.RegisterMethod() != util.RegisterMethodPassword {
+		return NewHTTPError(http.StatusUnauthorized, "account-authenticated node required", nil)
+	}
+
+	username := strings.TrimSpace(req.Header.Get(accountUsernameHeader))
+	password := req.Header.Get(accountPasswordHeader)
+	req.Header.Del(accountUsernameHeader)
+	req.Header.Del(accountPasswordHeader)
+	if ns.hasAccountProof(node.NodeKey(), userID) {
+		return nil
+	}
+	if username == "" || password == "" || len(username) > 255 || len([]byte(password)) > 72 {
+		return NewHTTPError(http.StatusUnauthorized, "account password proof required", nil)
+	}
+
+	account, err := ns.authenticateAccount(req.Context(), username, password, time.Now().UTC())
+	if errors.Is(err, errPasswordAuthRateLimited) {
+		return NewHTTPError(http.StatusTooManyRequests, "password authentication rate limited", nil)
+	}
+	if err != nil || account == nil || account.UserID == nil || types.UserID(*account.UserID) != userID {
+		return NewHTTPError(http.StatusUnauthorized, "account password proof rejected", nil)
+	}
+	account, unlockAccount, err := ns.headscale.state.BeginAccountAuthentication(
+		account.ID,
+		account.PasswordVersion,
+		time.Now().UTC(),
+	)
+	if err != nil {
+		return NewHTTPError(http.StatusUnauthorized, "account password proof rejected", nil)
+	}
+	defer unlockAccount()
+	if account.UserID == nil || types.UserID(*account.UserID) != userID {
+		return NewHTTPError(http.StatusUnauthorized, "account password proof rejected", nil)
+	}
+	ns.rememberAccountProof(account, node.NodeKey(), userID)
+	return nil
 }
 
 // RegistrationHandler handles the actual registration process of a node.
@@ -736,7 +958,7 @@ func (ns *noiseServer) RegistrationHandler(
 
 		ns.nodeKey = regReq.NodeKey
 
-		resp, err = ns.headscale.handleRegister(req.Context(), regReq, ns.conn.Peer())
+		resp, err = ns.headscale.handleRegister(req.Context(), regReq, ns.conn.Peer(), ns.authSource)
 		if err != nil {
 			if httpErr, ok := errors.AsType[HTTPError](err); ok {
 				resp = &tailcfg.RegisterResponse{
@@ -783,6 +1005,9 @@ func (ns *noiseServer) getAndValidateNode(mapRequest tailcfg.MapRequest) (types.
 	// Validate that the MachineKey in the Noise session matches the one associated with the NodeKey.
 	if ns.machineKey != nv.MachineKey() {
 		return types.NodeView{}, NewHTTPError(http.StatusNotFound, "node key in request does not match the one associated with this machine key", nil)
+	}
+	if nv.IsExpired() {
+		return types.NodeView{}, NewHTTPError(http.StatusUnauthorized, "node authentication has expired", nil)
 	}
 
 	return nv, nil

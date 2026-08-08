@@ -25,11 +25,6 @@ func init() {
 	listNodeRoutesCmd.Flags().Uint64P("identifier", "i", 0, "Node identifier (ID)")
 	nodeCmd.AddCommand(listNodeRoutesCmd)
 
-	registerNodeCmd.Flags().StringP("user", "u", "", "User")
-	registerNodeCmd.Flags().StringP("key", "k", "", "Key")
-	mustMarkRequired(registerNodeCmd, "user", "key")
-	nodeCmd.AddCommand(registerNodeCmd)
-
 	expireNodeCmd.Flags().Uint64P("identifier", "i", 0, "Node identifier (ID)")
 	expireNodeCmd.Flags().StringP("expiry", "e", "", "Set expire to (RFC3339 format, e.g. 2025-08-27T10:00:00Z), or leave empty to expire immediately.")
 	expireNodeCmd.Flags().BoolP("disable", "d", false, "Disable key expiry (node will never expire)")
@@ -61,31 +56,6 @@ var nodeCmd = &cobra.Command{
 	Use:     "nodes",
 	Short:   "Manage the nodes of Headscale",
 	Aliases: []string{"node"},
-}
-
-var registerNodeCmd = &cobra.Command{
-	Use:        "register",
-	Short:      "Registers a node to your network",
-	Deprecated: "use 'headscale auth register --auth-id <id> --user <user>' instead",
-	RunE: grpcRunE(func(ctx context.Context, client v1.HeadscaleServiceClient, cmd *cobra.Command, args []string) error {
-		user, _ := cmd.Flags().GetString("user")
-		registrationID, _ := cmd.Flags().GetString("key")
-
-		request := &v1.RegisterNodeRequest{
-			Key:  registrationID,
-			User: user,
-		}
-
-		response, err := client.RegisterNode(ctx, request)
-		if err != nil {
-			return fmt.Errorf("registering node: %w", err)
-		}
-
-		return printOutput(
-			cmd,
-			response.GetNode(),
-			fmt.Sprintf("Node %s registered", response.GetNode().GetGivenName()))
-	}),
 }
 
 var listNodesCmd = &cobra.Command{

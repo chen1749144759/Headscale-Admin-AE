@@ -1,144 +1,51 @@
-# Registration methods
+# 节点账户登录
 
-Headscale supports multiple ways to register a node. The preferred registration method depends on the identity of a node
-and your use case.
+Headscale-Admin-AE 只接受 ScaleTail 的账户密码登录。账户由 ScaleForge 管理，一个
+账户对应一个网络身份，可以拥有多台节点。
 
-## Identity model
+## 登录流程
 
-Tailscale's identity model distinguishes between personal and tagged nodes:
+1. 管理员在 ScaleForge 创建或启用账户，并将账户绑定到网络。
+2. 用户在与服务端版本匹配的 ScaleTail 中填写 HTTPS 控制地址、账户名和密码。
+3. ScaleTail 建立 TS2021 Noise 会话，服务端为该机器创建短期注册上下文。
+4. 密码证明在该机器的 Noise 会话内提交，并同时绑定 MachineKey 与注册上下文。
+5. 服务端验证账户状态、密码期限、网络绑定和节点数量后注册或恢复节点。
+6. 节点的长期数据面身份仍由机器密钥/节点密钥保护；新的控制会话仍需账户证明。
 
-- A personal node (or user-owned node) is owned by a human and typically refers to end-user devices such as laptops,
-  workstations or mobile phones. End-user devices are managed by a single user.
-- A tagged node (or service-based node or non-human node) provides services to the network. Common examples include web-
-  and database servers. Those nodes are typically managed by a team of users. Some additional restrictions apply for
-  tagged nodes, e.g. a tagged node is not allowed to [Tailscale SSH](https://tailscale.com/docs/features/tailscale-ssh)
-  into a personal node.
+密码证明接口只允许可信的 HTTPS `server_url`。HTTP、带用户信息、查询参数或异常路径
+的控制地址会被拒绝。
 
-Headscale implements Tailscale's identity model and distinguishes between personal and tagged nodes where a personal
-node is owned by a Headscale user and a tagged node is owned by a tag. Tagged devices are grouped under the special user
-`tagged-devices`.
+## 账户规则
 
-## Registration methods
+- 密码长度为 12 至 72 字节，服务端使用 bcrypt 哈希保存。
+- 密码最长有效期为 90 天。
+- 账户可被禁用，也可设置早于密码期限的账户到期时间。
+- 修改或重置密码会撤销旧管理会话，并要求节点用新密码完成后续账户证明。
+- 密码到期时，ScaleForge 只允许进入修改密码流程。
+- 节点有效期不晚于密码期限或账户到期时间。
+- 账户节点不能使用身份标签；子网路由和出口节点应通过路由策略单独管理。
 
-There are two main ways to register new nodes, [web authentication](#web-authentication) and [registration with a pre
-authenticated key](#pre-authenticated-key). Both methods can be used to register personal and tagged nodes.
+## 不支持的注册方式
 
-### Web authentication
+本分支不支持以下产品流程：
 
-Web authentication is the default method to register a new node. It's interactive, where the client initiates the
-registration and the Headscale administrator needs to approve the new node before it is allowed to join the network. A
-node can be approved with:
+- 浏览器授权页和 Auth URL 人工批准。
+- `headscale auth register` 或 `headscale nodes register` 手工注册。
+- 预认证 Key / auth key。
+- OIDC。
+- 官方 Tailscale 客户端依赖的上述认证流程。
 
-- Headscale CLI (described in this documentation)
-- [Headscale API](api.md)
-- Or delegated to an identity provider via [OpenID Connect](oidc.md)
+旧数据库中的预认证 Key、注册缓存字段和 protobuf 定义只为迁移兼容保留，不能用于新
+节点注册。
 
-Web authentication relies on the presence of a Headscale user. Use the `headscale users` command to create a new
-user[^1]:
+## 旧节点升级
 
-```console
-headscale users create <USER>
-```
+账户迁移会把非 `password` 注册方式的旧节点置为到期。升级后：
 
-=== "Personal devices"
+1. 先在 ScaleForge 确认账户存在并完成强制密码修改。
+2. 安装与服务端匹配的新版 ScaleTail。
+3. 从 ScaleTail 重新发起账户登录。
+4. 在 ScaleForge/Headscale 节点列表确认节点归属、路由和在线状态。
 
-    Run `tailscale up` to login your personal device:
-
-    ```console
-    tailscale up --login-server <YOUR_HEADSCALE_URL>
-    ```
-
-    Usually, a browser window with further instructions is opened. This page explains how to complete the registration
-    on your Headscale server and it also prints the Auth ID required to approve the node:
-
-    ```console
-    headscale auth register --user <USER> --auth-id <AUTH_ID>
-    ```
-
-    Congrations, the registration of your personal node is complete and it should be listed as "online" in the output of
-    `headscale nodes list`. The "User" column displays `<USER>` as the owner of the node.
-
-=== "Tagged devices"
-
-    Your Headscale user needs to be authorized to register tagged devices. This authorization is specified in the
-    [`tagOwners`](https://tailscale.com/docs/reference/syntax/policy-file#tag-owners) section of the [ACL](acls.md). A
-    simple example looks like this:
-
-    ```json title="The user alice can register nodes tagged with tag:server"
-    {
-      "tagOwners": {
-        "tag:server": ["alice@"]
-      },
-      // more rules
-    }
-    ```
-
-    Run `tailscale up` and provide at least one tag to login a tagged device:
-
-    ```console
-    tailscale up --login-server <YOUR_HEADSCALE_URL> --advertise-tags tag:<TAG>
-    ```
-
-    Usually, a browser window with further instructions is opened. This page explains how to complete the registration
-    on your Headscale server and it also prints the Auth ID required to approve the node:
-
-    ```console
-    headscale auth register --user <USER> --auth-id <AUTH_ID>
-    ```
-
-    Headscale checks that `<USER>` is allowed to register a node with the specified tag(s) and then transfers ownership
-    of the new node to the special user `tagged-devices`. The registration of a tagged node is complete and it should be
-    listed as "online" in the output of `headscale nodes list`. The "User" column displays `tagged-devices` as the owner
-    of the node. See the "Tags" column for the list of assigned tags.
-
-### Pre authenticated key
-
-Registration with a pre authenticated key (or auth key) is a non-interactive way to register a new node. The Headscale
-administrator creates a preauthkey upfront and this preauthkey can then be used to register a node non-interactively.
-Its best suited for automation.
-
-=== "Personal devices"
-
-    A personal node is always assigned to a Headscale user. Use the `headscale users` command to create a new user[^1]:
-
-    ```console
-    headscale users create <USER>
-    ```
-
-    Use the `headscale user list` command to learn its `<USER_ID>` and create a new pre authenticated key for your user:
-
-    ```console
-    headscale preauthkeys create --user <USER_ID>
-    ```
-
-    The above prints a pre authenticated key with the default settings (can be used once and is valid for one hour). Use
-    this auth key to register a node non-interactively:
-
-    ```console
-    tailscale up --login-server <YOUR_HEADSCALE_URL> --authkey <YOUR_AUTH_KEY>
-    ```
-
-    Congrations, the registration of your personal node is complete and it should be listed as "online" in the output of
-    `headscale nodes list`. The "User" column displays `<USER>` as the owner of the node.
-
-=== "Tagged devices"
-
-    Create a new pre authenticated key and provide at least one tag:
-
-    ```console
-    headscale preauthkeys create --tags tag:<TAG>
-    ```
-
-    The above prints a pre authenticated key with the default settings (can be used once and is valid for one hour). Use
-    this auth key to register a node non-interactively. You don't need to provide the `--advertise-tags` parameter as
-    the tags are automatically read from the pre authenticated key:
-
-    ```console
-    tailscale up --login-server <YOUR_HEADSCALE_URL> --authkey <YOUR_AUTH_KEY>
-    ```
-
-    The registration of a tagged node is complete and it should be listed as "online" in the output of
-    `headscale nodes list`. The "User" column displays `tagged-devices` as the owner of the node. See the "Tags" column for the list of
-    assigned tags.
-
-[^1]: [Ensure that the Headscale username does not end with `@`.](oidc.md#reference-a-user-in-the-policy)
+不要删除整个数据库来“解决”登录问题；旧节点记录可以留作审计，成功账户登录后由
+服务端按 MachineKey 和账户归属安全恢复或创建节点。

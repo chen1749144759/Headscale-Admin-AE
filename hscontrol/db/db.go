@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/glebarez/sqlite"
@@ -772,6 +771,40 @@ WHERE user_id IS NULL
 				},
 				Rollback: func(db *gorm.DB) error { return nil },
 			},
+			{
+				// Split human login identities out of the Headscale network
+				// namespace table. Existing bcrypt/plaintext ScaleForge accounts
+				// are migrated before the legacy columns are removed.
+				ID:       "202608081200-create-scaletail-accounts",
+				Migrate:  migrateScaleTailAccounts,
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
+			{
+				// Account/password is the only supported human authentication
+				// path. Existing nodes must reauthenticate once instead of keeping
+				// an unlimited legacy auth-key/CLI/OIDC session.
+				ID:       "202608081210-expire-legacy-auth-nodes",
+				Migrate:  expireLegacyAuthNodes,
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
+			{
+				// Persist the DNS fields managed at runtime by ScaleForge without
+				// granting the management container access to Headscale's config.
+				ID: "202608081220-create-runtime-settings",
+				Migrate: func(tx *gorm.DB) error {
+					if err := tx.Exec(`
+CREATE TABLE IF NOT EXISTS runtime_settings (
+    key text PRIMARY KEY,
+    value text NOT NULL,
+    updated_at timestamp NOT NULL
+);`).Error; err != nil {
+						return fmt.Errorf("creating runtime_settings table: %w", err)
+					}
+
+					return nil
+				},
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
 		},
 	)
 
@@ -779,10 +812,14 @@ WHERE user_id IS NULL
 		// Create all tables using AutoMigrate
 		err := tx.AutoMigrate(
 			&types.User{},
+			&types.Account{},
+			&types.AccountSession{},
+			&types.AccountPasswordHistory{},
 			&types.PreAuthKey{},
 			&types.APIKey{},
 			&types.Node{},
 			&types.Policy{},
+			&types.RuntimeSetting{},
 		)
 		if err != nil {
 			return err
@@ -792,6 +829,13 @@ WHERE user_id IS NULL
 		// to ensure we can recreate them in the correct format
 		dropIndexes := []string{
 			`DROP INDEX IF EXISTS "idx_users_deleted_at"`,
+			`DROP INDEX IF EXISTS "idx_accounts_deleted_at"`,
+			`DROP INDEX IF EXISTS "idx_accounts_username"`,
+			`DROP INDEX IF EXISTS "idx_accounts_user_id"`,
+			`DROP INDEX IF EXISTS "idx_account_sessions_token_hash"`,
+			`DROP INDEX IF EXISTS "idx_account_sessions_account_id"`,
+			`DROP INDEX IF EXISTS "idx_account_sessions_expires_at"`,
+			`DROP INDEX IF EXISTS "idx_account_password_histories_account_id"`,
 			`DROP INDEX IF EXISTS "idx_api_keys_prefix"`,
 			`DROP INDEX IF EXISTS "idx_policies_deleted_at"`,
 			`DROP INDEX IF EXISTS "idx_provider_identifier"`,
@@ -810,6 +854,13 @@ WHERE user_id IS NULL
 		// Recreate indexes without backticks to match schema.sql format
 		indexes := []string{
 			`CREATE INDEX idx_users_deleted_at ON users(deleted_at)`,
+			`CREATE INDEX idx_accounts_deleted_at ON accounts(deleted_at)`,
+			`CREATE UNIQUE INDEX idx_accounts_username ON accounts(username)`,
+			`CREATE UNIQUE INDEX idx_accounts_user_id ON accounts(user_id)`,
+			`CREATE UNIQUE INDEX idx_account_sessions_token_hash ON account_sessions(token_hash)`,
+			`CREATE INDEX idx_account_sessions_account_id ON account_sessions(account_id)`,
+			`CREATE INDEX idx_account_sessions_expires_at ON account_sessions(expires_at)`,
+			`CREATE INDEX idx_account_password_histories_account_id ON account_password_histories(account_id)`,
 			`CREATE UNIQUE INDEX idx_api_keys_prefix ON api_keys(prefix)`,
 			`CREATE INDEX idx_policies_deleted_at ON policies(deleted_at)`,
 			`CREATE UNIQUE INDEX idx_provider_identifier ON users(provider_identifier) WHERE provider_identifier IS NOT NULL`,
@@ -845,11 +896,6 @@ WHERE user_id IS NULL
 				err,
 			)
 		}
-	}
-
-	// Headscale-Admin-Pro: 确保自定义表和字段存在
-	if err := ensureAdminProSchema(dbConn); err != nil {
-		return nil, fmt.Errorf("ensuring admin-pro schema: %w", err)
 	}
 
 	// Validate that the schema ends up in the expected state.
@@ -888,6 +934,21 @@ WHERE user_id IS NULL
 				"policies_old",
 				"acl_old",
 				"log_old",
+				// ScaleForge owns and migrates its application schema.
+				"scaleforge_schema_migrations",
+				"acl",
+				"log",
+				"client_policies",
+				"client_policy_states",
+				"traffic_samples",
+				"traffic_hourly",
+				"traffic_daily",
+				"node_ip_observations",
+				"flow_summaries",
+				"security_events",
+				"trusted_networks",
+				"risk_rules",
+				"client_releases",
 			},
 		}
 
@@ -899,6 +960,12 @@ WHERE user_id IS NULL
 	db := HSDatabase{
 		DB:  dbConn,
 		cfg: cfg,
+	}
+	if _, err := db.CleanupAccountSessions(time.Now().UTC()); err != nil {
+		if sqlDB, closeErr := dbConn.DB(); closeErr == nil {
+			_ = sqlDB.Close()
+		}
+		return nil, err
 	}
 
 	return &db, err
@@ -1133,482 +1200,6 @@ func runMigrations(cfg types.DatabaseConfig, dbConn *gorm.DB, migrations *gormig
 	}
 
 	return nil
-}
-
-// ensureAdminProSchema ensures the Headscale-Admin-Pro custom tables
-// (acl, log) and extra columns on the users table exist in the database.
-// This runs after GORM migrations but before squibble schema validation.
-func ensureAdminProSchema(dbConn *gorm.DB) error {
-	log.Info().Msg("Ensuring Headscale-Admin-Pro custom schema...")
-
-	isPostgres := dbConn.Dialector.Name() == "postgres"
-
-	// Add extra columns to users table (idempotent via IF NOT EXISTS-style handling)
-	userColumns := []struct {
-		name    string
-		sqlType string
-	}{
-		{"password", "text"},
-		{"expire", "timestamp"},
-		{"cellphone", "text"},
-		{"role", "text"},
-		{"enable", "text"},
-		{"route", "text"},
-		{"node", "text"},
-	}
-	for _, col := range userColumns {
-		var sql string
-		if isPostgres {
-			sql = fmt.Sprintf("ALTER TABLE users ADD COLUMN IF NOT EXISTS %s %s", col.name, col.sqlType)
-		} else {
-			// SQLite does not support ADD COLUMN IF NOT EXISTS,
-			// so we catch "duplicate column" errors and continue
-			colType := col.sqlType
-			if colType == "timestamp" {
-				colType = "datetime"
-			}
-			sql = fmt.Sprintf("ALTER TABLE users ADD COLUMN %s %s", col.name, colType)
-		}
-		if err := dbConn.Exec(sql).Error; err != nil {
-			// Ignore "duplicate column name" / "already exists" errors
-			if !isDuplicateColumnError(err) {
-				log.Warn().Err(err).Str("column", col.name).Msg("Failed to add users column (non-fatal)")
-			}
-		}
-	}
-
-	// Create acl and log tables if they don't exist
-	var createTables []string
-	if isPostgres {
-		createTables = []string{
-			`CREATE TABLE IF NOT EXISTS acl (
-				id SERIAL PRIMARY KEY,
-				acl TEXT,
-				user_id INTEGER REFERENCES users(id) ON DELETE CASCADE
-			)`,
-			`CREATE TABLE IF NOT EXISTS log (
-				id SERIAL PRIMARY KEY,
-				user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-				content TEXT,
-				created_at TIMESTAMP DEFAULT NOW()
-			)`,
-			`CREATE TABLE IF NOT EXISTS client_policies (
-				id SERIAL PRIMARY KEY,
-				scope TEXT NOT NULL,
-				group_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-				group_name TEXT,
-				machine_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
-				machine_name TEXT,
-				rate_up_mbps DOUBLE PRECISION,
-				rate_down_mbps DOUBLE PRECISION,
-				monthly_quota_gb DOUBLE PRECISION,
-				exceed_action TEXT DEFAULT 'throttle',
-				enabled BOOLEAN DEFAULT TRUE,
-				priority INTEGER DEFAULT 100,
-				created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-				created_at TIMESTAMP DEFAULT NOW(),
-				updated_at TIMESTAMP DEFAULT NOW(),
-				remark TEXT
-			)`,
-			`CREATE TABLE IF NOT EXISTS client_policy_states (
-				id SERIAL PRIMARY KEY,
-				policy_id INTEGER REFERENCES client_policies(id) ON DELETE SET NULL,
-				machine_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
-				machine_name TEXT,
-				applied BOOLEAN DEFAULT FALSE,
-				effective_policy JSONB,
-				error TEXT,
-				applied_at TIMESTAMP,
-				updated_at TIMESTAMP DEFAULT NOW()
-			)`,
-			`CREATE TABLE IF NOT EXISTS traffic_samples (
-				id SERIAL PRIMARY KEY,
-				machine_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
-				machine_name TEXT,
-				group_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-				group_name TEXT,
-				rx_bytes_total BIGINT DEFAULT 0,
-				tx_bytes_total BIGINT DEFAULT 0,
-				rx_bytes_delta BIGINT DEFAULT 0,
-				tx_bytes_delta BIGINT DEFAULT 0,
-				rx_rate_bps DOUBLE PRECISION DEFAULT 0,
-				tx_rate_bps DOUBLE PRECISION DEFAULT 0,
-				derp BOOLEAN DEFAULT FALSE,
-				endpoint_type TEXT,
-				observed_at TIMESTAMP DEFAULT NOW()
-			)`,
-			`CREATE TABLE IF NOT EXISTS traffic_hourly (
-				id SERIAL PRIMARY KEY,
-				bucket_start TIMESTAMP NOT NULL,
-				machine_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
-				group_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-				rx_bytes BIGINT DEFAULT 0,
-				tx_bytes BIGINT DEFAULT 0,
-				peak_rx_rate_bps DOUBLE PRECISION DEFAULT 0,
-				peak_tx_rate_bps DOUBLE PRECISION DEFAULT 0,
-				UNIQUE(bucket_start, machine_id)
-			)`,
-			`CREATE TABLE IF NOT EXISTS traffic_daily (
-				id SERIAL PRIMARY KEY,
-				bucket_date DATE NOT NULL,
-				machine_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
-				group_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-				rx_bytes BIGINT DEFAULT 0,
-				tx_bytes BIGINT DEFAULT 0,
-				UNIQUE(bucket_date, machine_id)
-			)`,
-			`CREATE TABLE IF NOT EXISTS node_ip_observations (
-				id SERIAL PRIMARY KEY,
-				machine_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
-				machine_name TEXT,
-				group_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-				group_name TEXT,
-				ip TEXT NOT NULL,
-				country TEXT,
-				region TEXT,
-				city TEXT,
-				asn TEXT,
-				isp TEXT,
-				risk_flags JSONB,
-				first_seen TIMESTAMP DEFAULT NOW(),
-				last_seen TIMESTAMP DEFAULT NOW(),
-				seen_count INTEGER DEFAULT 1
-			)`,
-			`CREATE TABLE IF NOT EXISTS flow_summaries (
-				id SERIAL PRIMARY KEY,
-				machine_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
-				machine_name TEXT,
-				group_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-				group_name TEXT,
-				window_start TIMESTAMP NOT NULL,
-				window_seconds INTEGER NOT NULL DEFAULT 60,
-				dst_ip TEXT,
-				dst_port INTEGER,
-				protocol TEXT,
-				direction TEXT,
-				bytes BIGINT DEFAULT 0,
-				packets BIGINT DEFAULT 0,
-				connection_count INTEGER DEFAULT 0,
-				state TEXT,
-				process_id INTEGER,
-				process_name TEXT
-			)`,
-			`ALTER TABLE flow_summaries ADD COLUMN IF NOT EXISTS machine_name TEXT`,
-			`ALTER TABLE flow_summaries ADD COLUMN IF NOT EXISTS group_name TEXT`,
-			`ALTER TABLE flow_summaries ADD COLUMN IF NOT EXISTS connection_count INTEGER DEFAULT 0`,
-			`ALTER TABLE flow_summaries ADD COLUMN IF NOT EXISTS state TEXT`,
-			`ALTER TABLE flow_summaries ADD COLUMN IF NOT EXISTS process_id INTEGER`,
-			`ALTER TABLE flow_summaries ADD COLUMN IF NOT EXISTS process_name TEXT`,
-			`CREATE TABLE IF NOT EXISTS security_events (
-				id SERIAL PRIMARY KEY,
-				level TEXT NOT NULL DEFAULT 'info',
-				event_type TEXT NOT NULL,
-				title TEXT NOT NULL,
-				description TEXT,
-				group_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-				group_name TEXT,
-				machine_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
-				machine_name TEXT,
-				ip TEXT,
-				country TEXT,
-				city TEXT,
-				asn TEXT,
-				evidence JSONB,
-				status TEXT NOT NULL DEFAULT 'open',
-				handled_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-				handled_at TIMESTAMP,
-				created_at TIMESTAMP DEFAULT NOW()
-			)`,
-			`CREATE TABLE IF NOT EXISTS trusted_networks (
-				id SERIAL PRIMARY KEY,
-				kind TEXT NOT NULL,
-				value TEXT NOT NULL,
-				description TEXT,
-				enabled BOOLEAN DEFAULT TRUE,
-				created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-				created_at TIMESTAMP DEFAULT NOW()
-			)`,
-			`CREATE TABLE IF NOT EXISTS risk_rules (
-				id SERIAL PRIMARY KEY,
-				rule_key TEXT NOT NULL UNIQUE,
-				name TEXT NOT NULL,
-				level TEXT NOT NULL DEFAULT 'medium',
-				enabled BOOLEAN DEFAULT TRUE,
-				config JSONB,
-				updated_at TIMESTAMP DEFAULT NOW()
-			)`,
-			`CREATE TABLE IF NOT EXISTS client_releases (
-				id SERIAL PRIMARY KEY,
-				version TEXT NOT NULL,
-				platform TEXT NOT NULL DEFAULT 'windows-amd64',
-				update_type TEXT NOT NULL DEFAULT 'suggested',
-				title TEXT,
-				description TEXT,
-				download_url TEXT,
-				sha256 TEXT,
-				signature TEXT,
-				file_size BIGINT,
-				release_notes TEXT,
-				enabled BOOLEAN DEFAULT TRUE,
-				created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-				created_at TIMESTAMP DEFAULT NOW(),
-				updated_at TIMESTAMP DEFAULT NOW()
-			)`,
-		}
-	} else {
-		createTables = []string{
-			`CREATE TABLE IF NOT EXISTS acl (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				acl TEXT,
-				user_id INTEGER,
-				CONSTRAINT fk_acl_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-			)`,
-			`CREATE TABLE IF NOT EXISTS log (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				user_id INTEGER,
-				content TEXT,
-				created_at DATETIME,
-				CONSTRAINT fk_log_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-			)`,
-			`CREATE TABLE IF NOT EXISTS client_policies (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				scope TEXT NOT NULL,
-				group_id INTEGER,
-				group_name TEXT,
-				machine_id INTEGER,
-				machine_name TEXT,
-				rate_up_mbps REAL,
-				rate_down_mbps REAL,
-				monthly_quota_gb REAL,
-				exceed_action TEXT DEFAULT 'throttle',
-				enabled INTEGER DEFAULT 1,
-				priority INTEGER DEFAULT 100,
-				created_by INTEGER,
-				created_at DATETIME,
-				updated_at DATETIME,
-				remark TEXT
-			)`,
-			`CREATE TABLE IF NOT EXISTS client_policy_states (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				policy_id INTEGER,
-				machine_id INTEGER,
-				machine_name TEXT,
-				applied INTEGER DEFAULT 0,
-				effective_policy TEXT,
-				error TEXT,
-				applied_at DATETIME,
-				updated_at DATETIME
-			)`,
-			`CREATE TABLE IF NOT EXISTS traffic_samples (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				machine_id INTEGER,
-				machine_name TEXT,
-				group_id INTEGER,
-				group_name TEXT,
-				rx_bytes_total INTEGER DEFAULT 0,
-				tx_bytes_total INTEGER DEFAULT 0,
-				rx_bytes_delta INTEGER DEFAULT 0,
-				tx_bytes_delta INTEGER DEFAULT 0,
-				rx_rate_bps REAL DEFAULT 0,
-				tx_rate_bps REAL DEFAULT 0,
-				derp INTEGER DEFAULT 0,
-				endpoint_type TEXT,
-				observed_at DATETIME
-			)`,
-			`CREATE TABLE IF NOT EXISTS traffic_hourly (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				bucket_start DATETIME NOT NULL,
-				machine_id INTEGER,
-				group_id INTEGER,
-				rx_bytes INTEGER DEFAULT 0,
-				tx_bytes INTEGER DEFAULT 0,
-				peak_rx_rate_bps REAL DEFAULT 0,
-				peak_tx_rate_bps REAL DEFAULT 0,
-				UNIQUE(bucket_start, machine_id)
-			)`,
-			`CREATE TABLE IF NOT EXISTS traffic_daily (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				bucket_date DATE NOT NULL,
-				machine_id INTEGER,
-				group_id INTEGER,
-				rx_bytes INTEGER DEFAULT 0,
-				tx_bytes INTEGER DEFAULT 0,
-				UNIQUE(bucket_date, machine_id)
-			)`,
-			`CREATE TABLE IF NOT EXISTS node_ip_observations (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				machine_id INTEGER,
-				machine_name TEXT,
-				group_id INTEGER,
-				group_name TEXT,
-				ip TEXT NOT NULL,
-				country TEXT,
-				region TEXT,
-				city TEXT,
-				asn TEXT,
-				isp TEXT,
-				risk_flags TEXT,
-				first_seen DATETIME,
-				last_seen DATETIME,
-				seen_count INTEGER DEFAULT 1
-			)`,
-			`CREATE TABLE IF NOT EXISTS flow_summaries (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				machine_id INTEGER,
-				machine_name TEXT,
-				group_id INTEGER,
-				group_name TEXT,
-				window_start DATETIME NOT NULL,
-				window_seconds INTEGER NOT NULL DEFAULT 60,
-				dst_ip TEXT,
-				dst_port INTEGER,
-				protocol TEXT,
-				direction TEXT,
-				bytes INTEGER DEFAULT 0,
-				packets INTEGER DEFAULT 0,
-				connection_count INTEGER DEFAULT 0,
-				state TEXT,
-				process_id INTEGER,
-				process_name TEXT
-			)`,
-			`CREATE TABLE IF NOT EXISTS security_events (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				level TEXT NOT NULL DEFAULT 'info',
-				event_type TEXT NOT NULL,
-				title TEXT NOT NULL,
-				description TEXT,
-				group_id INTEGER,
-				group_name TEXT,
-				machine_id INTEGER,
-				machine_name TEXT,
-				ip TEXT,
-				country TEXT,
-				city TEXT,
-				asn TEXT,
-				evidence TEXT,
-				status TEXT NOT NULL DEFAULT 'open',
-				handled_by INTEGER,
-				handled_at DATETIME,
-				created_at DATETIME
-			)`,
-			`CREATE TABLE IF NOT EXISTS trusted_networks (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				kind TEXT NOT NULL,
-				value TEXT NOT NULL,
-				description TEXT,
-				enabled INTEGER DEFAULT 1,
-				created_by INTEGER,
-				created_at DATETIME
-			)`,
-			`CREATE TABLE IF NOT EXISTS risk_rules (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				rule_key TEXT NOT NULL UNIQUE,
-				name TEXT NOT NULL,
-				level TEXT NOT NULL DEFAULT 'medium',
-				enabled INTEGER DEFAULT 1,
-				config TEXT,
-				updated_at DATETIME
-			)`,
-			`CREATE TABLE IF NOT EXISTS client_releases (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				version TEXT NOT NULL,
-				platform TEXT NOT NULL DEFAULT 'windows-amd64',
-				update_type TEXT NOT NULL DEFAULT 'suggested',
-				title TEXT,
-				description TEXT,
-				download_url TEXT,
-				sha256 TEXT,
-				signature TEXT,
-				file_size INTEGER,
-				release_notes TEXT,
-				enabled INTEGER DEFAULT 1,
-				created_by INTEGER,
-				created_at DATETIME,
-				updated_at DATETIME
-			)`,
-		}
-	}
-	for _, sql := range createTables {
-		if err := dbConn.Exec(sql).Error; err != nil {
-			log.Warn().Err(err).Msg("Failed to create admin-pro table (non-fatal)")
-		}
-	}
-
-	flowColumns := []struct {
-		name    string
-		sqlType string
-	}{
-		{"machine_name", "text"},
-		{"group_name", "text"},
-		{"connection_count", "integer default 0"},
-		{"state", "text"},
-		{"process_id", "integer"},
-		{"process_name", "text"},
-	}
-	for _, col := range flowColumns {
-		sql := fmt.Sprintf("ALTER TABLE flow_summaries ADD COLUMN %s %s", col.name, col.sqlType)
-		if isPostgres {
-			sql = fmt.Sprintf("ALTER TABLE flow_summaries ADD COLUMN IF NOT EXISTS %s %s", col.name, col.sqlType)
-		}
-		if err := dbConn.Exec(sql).Error; err != nil && !isDuplicateColumnError(err) {
-			log.Warn().Err(err).Str("column", col.name).Msg("Failed to add flow_summaries column (non-fatal)")
-		}
-	}
-
-	releaseColumns := []struct {
-		name    string
-		sqlType string
-	}{
-		{"sha256", "text"},
-		{"signature", "text"},
-		{"file_size", "bigint"},
-	}
-	for _, col := range releaseColumns {
-		sql := fmt.Sprintf("ALTER TABLE client_releases ADD COLUMN %s %s", col.name, col.sqlType)
-		if isPostgres {
-			sql = fmt.Sprintf("ALTER TABLE client_releases ADD COLUMN IF NOT EXISTS %s %s", col.name, col.sqlType)
-		}
-		if err := dbConn.Exec(sql).Error; err != nil && !isDuplicateColumnError(err) {
-			log.Warn().Err(err).Str("column", col.name).Msg("Failed to add client_releases column (non-fatal)")
-		}
-	}
-
-	// Create indexes for the new tables
-	createIndexes := []string{
-		"CREATE INDEX IF NOT EXISTS idx_acl_user_id ON acl(user_id)",
-		"CREATE INDEX IF NOT EXISTS idx_log_user_id ON log(user_id)",
-		"CREATE INDEX IF NOT EXISTS idx_client_policies_scope ON client_policies(scope)",
-		"CREATE INDEX IF NOT EXISTS idx_client_policies_group_id ON client_policies(group_id)",
-		"CREATE INDEX IF NOT EXISTS idx_client_policies_machine_id ON client_policies(machine_id)",
-		"CREATE INDEX IF NOT EXISTS idx_traffic_samples_machine_time ON traffic_samples(machine_id, observed_at)",
-		"CREATE INDEX IF NOT EXISTS idx_traffic_samples_group_time ON traffic_samples(group_id, observed_at)",
-		"CREATE INDEX IF NOT EXISTS idx_node_ip_observations_machine ON node_ip_observations(machine_id)",
-		"CREATE INDEX IF NOT EXISTS idx_flow_summaries_machine_window ON flow_summaries(machine_id, window_start)",
-		"CREATE INDEX IF NOT EXISTS idx_security_events_status ON security_events(status)",
-		"CREATE INDEX IF NOT EXISTS idx_security_events_level ON security_events(level)",
-		"CREATE INDEX IF NOT EXISTS idx_security_events_created_at ON security_events(created_at)",
-		"CREATE INDEX IF NOT EXISTS idx_trusted_networks_kind_value ON trusted_networks(kind, value)",
-		"CREATE INDEX IF NOT EXISTS idx_client_releases_enabled_platform ON client_releases(enabled, platform)",
-		"CREATE INDEX IF NOT EXISTS idx_client_releases_created_at ON client_releases(created_at)",
-	}
-	for _, sql := range createIndexes {
-		if err := dbConn.Exec(sql).Error; err != nil {
-			log.Warn().Err(err).Msg("Failed to create admin-pro index (non-fatal)")
-		}
-	}
-
-	log.Info().Msg("Headscale-Admin-Pro custom schema ensured")
-	return nil
-}
-
-// isDuplicateColumnError checks if the SQLite error is "duplicate column name".
-func isDuplicateColumnError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "duplicate column name") ||
-		strings.Contains(errStr, "already exists")
 }
 
 func (hsdb *HSDatabase) PingDB(ctx context.Context) error {

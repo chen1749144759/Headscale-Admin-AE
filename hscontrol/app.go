@@ -25,7 +25,6 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/metrics"
 	grpcRuntime "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
-	"github.com/juanfont/headscale"
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/db"
@@ -46,18 +45,11 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/reflection"
-	"google.golang.org/grpc/status"
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
-	"tailscale.com/util/dnsname"
 )
 
 var (
@@ -84,7 +76,6 @@ func init() {
 }
 
 const (
-	AuthPrefix         = "Bearer "
 	updateInterval     = 5 * time.Second
 	privateKeyFileMode = 0o600
 	headscaleDirPerm   = 0o700
@@ -100,9 +91,11 @@ type Headscale struct {
 	DERPServer *derpServer.DERPServer
 
 	// Things that generate changes
-	extraRecordMan *dns.ExtraRecordsMan
-	authProvider   AuthProvider
-	mapBatcher     *mapper.Batcher
+	extraRecordMan    *dns.ExtraRecordsMan
+	mapBatcher        *mapper.Batcher
+	scaleForgeHTTP    *http.Client
+	scaleForgeAuthKey []byte
+	scaleForgeReplay  *internalAuthReplayCache
 
 	clientStreamsOpen sync.WaitGroup
 }
@@ -132,12 +125,27 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init state: %w", err)
 	}
+	if err := bootstrapScaleForgeAccount(cfg, s); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("bootstrapping ScaleForge identity: %w", err)
+	}
+	var scaleForgeAuthKey []byte
+	if cfg.ScaleForge.Socket != "" || cfg.ScaleForge.BackendSocket != "" {
+		scaleForgeAuthKey, err = readInternalAuthKey(cfg.ScaleForge.InternalAuthKeyFile)
+		if err != nil {
+			_ = s.Close()
+			return nil, err
+		}
+	}
 
 	app := Headscale{
 		cfg:               cfg,
 		noisePrivateKey:   noisePrivateKey,
 		clientStreamsOpen: sync.WaitGroup{},
 		state:             s,
+		scaleForgeHTTP:    newScaleForgeBackendClient(cfg.ScaleForge.BackendSocket),
+		scaleForgeAuthKey: scaleForgeAuthKey,
+		scaleForgeReplay:  newInternalAuthReplayCache(internalAuthReplayLimit),
 	}
 
 	// Initialize ephemeral garbage collector
@@ -160,57 +168,6 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		log.Debug().Caller().EmbedObject(node).Msg("ephemeral node deleted because garbage collection timeout reached")
 	})
 	app.ephemeralGC = ephemeralGC
-
-	var authProvider AuthProvider
-
-	authProvider = NewAuthProviderWeb(cfg.ServerURL)
-	if cfg.OIDC.Issuer != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		oidcProvider, err := NewAuthProviderOIDC(
-			ctx,
-			&app,
-			cfg.ServerURL,
-			&cfg.OIDC,
-		)
-		if err != nil {
-			if cfg.OIDC.OnlyStartIfOIDCIsAvailable {
-				return nil, err
-			} else {
-				log.Warn().Err(err).Msg("failed to set up OIDC provider, falling back to CLI based authentication")
-			}
-		} else {
-			authProvider = oidcProvider
-		}
-	}
-
-	app.authProvider = authProvider
-
-	if app.cfg.TailcfgDNSConfig != nil && app.cfg.TailcfgDNSConfig.Proxied { // if MagicDNS
-		// TODO(kradalby): revisit why this takes a list.
-		var magicDNSDomains []dnsname.FQDN
-		if cfg.PrefixV4 != nil {
-			magicDNSDomains = append(
-				magicDNSDomains,
-				util.GenerateIPv4DNSRootDomain(*cfg.PrefixV4)...)
-		}
-
-		if cfg.PrefixV6 != nil {
-			magicDNSDomains = append(
-				magicDNSDomains,
-				util.GenerateIPv6DNSRootDomain(*cfg.PrefixV6)...)
-		}
-
-		// we might have routes already from Split DNS
-		if app.cfg.TailcfgDNSConfig.Routes == nil {
-			app.cfg.TailcfgDNSConfig.Routes = make(map[string][]*dnstype.Resolver)
-		}
-
-		for _, d := range magicDNSDomains {
-			app.cfg.TailcfgDNSConfig.Routes[d.WithoutTrailingDot()] = nil
-		}
-	}
 
 	if cfg.DERP.ServerEnabled {
 		derpServerKey, err := readOrCreatePrivateKey(cfg.DERP.ServerPrivateKeyPath)
@@ -354,7 +311,7 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 				continue
 			}
 
-			h.cfg.TailcfgDNSConfig.ExtraRecords = records
+			h.state.SetExtraDNSRecords(records)
 
 			h.Change(change.ExtraRecords())
 
@@ -364,128 +321,25 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 	}
 }
 
-func (h *Headscale) grpcAuthenticationInterceptor(ctx context.Context,
-	req any,
-	info *grpc.UnaryServerInfo,
-	handler grpc.UnaryHandler,
-) (any, error) {
-	// Check if the request is coming from the on-server client.
-	// This is not secure, but it is to maintain maintainability
-	// with the "legacy" database-based client
-	// It is also needed for grpc-gateway to be able to connect to
-	// the server
-	client, _ := peer.FromContext(ctx)
-
-	log.Trace().
-		Caller().
-		Str("client_address", client.Addr.String()).
-		Msg("Client is trying to authenticate")
-
-	meta, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return ctx, status.Errorf(
-			codes.InvalidArgument,
-			"retrieving metadata",
-		)
-	}
-
-	authHeader, ok := meta["authorization"]
-	if !ok {
-		return ctx, status.Errorf(
-			codes.Unauthenticated,
-			"authorization token not supplied",
-		)
-	}
-
-	token := authHeader[0]
-
-	if !strings.HasPrefix(token, AuthPrefix) {
-		return ctx, status.Error(
-			codes.Unauthenticated,
-			`missing "Bearer " prefix in "Authorization" header`,
-		)
-	}
-
-	valid, err := h.state.ValidateAPIKey(strings.TrimPrefix(token, AuthPrefix))
-	if err != nil {
-		return ctx, status.Error(codes.Internal, "validating token")
-	}
-
-	if !valid {
-		log.Info().
-			Str("client_address", client.Addr.String()).
-			Msg("invalid token")
-
-		return ctx, status.Error(codes.Unauthenticated, "invalid token")
-	}
-
-	return handler(ctx, req)
-}
-
-func (h *Headscale) httpAuthenticationMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(
-		writer http.ResponseWriter,
-		req *http.Request,
-	) {
-		log.Trace().
-			Caller().
-			Str("client_address", req.RemoteAddr).
-			Msg("HTTP authentication invoked")
-
-		authHeader := req.Header.Get("Authorization")
-
-		writeUnauthorized := func(statusCode int) {
-			writer.WriteHeader(statusCode)
-
-			if _, err := writer.Write([]byte("Unauthorized")); err != nil { //nolint:noinlineerr
-				log.Error().Err(err).Msg("writing HTTP response failed")
-			}
-		}
-
-		if !strings.HasPrefix(authHeader, AuthPrefix) {
-			log.Error().
-				Caller().
-				Str("client_address", req.RemoteAddr).
-				Msg(`missing "Bearer " prefix in "Authorization" header`)
-			writeUnauthorized(http.StatusUnauthorized)
-
-			return
-		}
-
-		valid, err := h.state.ValidateAPIKey(strings.TrimPrefix(authHeader, AuthPrefix))
-		if err != nil {
-			log.Info().
-				Caller().
-				Err(err).
-				Str("client_address", req.RemoteAddr).
-				Msg("failed to validate token")
-			writeUnauthorized(http.StatusUnauthorized)
-
-			return
-		}
-
-		if !valid {
-			log.Info().
-				Str("client_address", req.RemoteAddr).
-				Msg("invalid token")
-			writeUnauthorized(http.StatusUnauthorized)
-
-			return
-		}
-
-		next.ServeHTTP(writer, req)
-	})
-}
-
 // ensureUnixSocketIsAbsent will check if the given path for headscales unix socket is clear
 // and will remove it if it is not.
 func (h *Headscale) ensureUnixSocketIsAbsent() error {
-	// File does not exist, all fine
-	if _, err := os.Stat(h.cfg.UnixSocket); errors.Is(err, os.ErrNotExist) { //nolint:noinlineerr
+	return ensureUnixSocketIsAbsent(h.cfg.UnixSocket)
+}
+
+func ensureUnixSocketIsAbsent(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("refusing to remove non-socket path %q", path)
+	}
 
-	return os.Remove(h.cfg.UnixSocket)
+	return os.Remove(path)
 }
 
 // securityHeaders sets baseline response headers on every HTTP response:
@@ -502,7 +356,7 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
+func (h *Headscale) createRouter() *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(metrics.Collector(metrics.CollectorOpts{
 		Host:  false,
@@ -512,7 +366,6 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 		},
 	}))
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
 	r.Use(middleware.RequestLogger(&zerologRequestLogger{}))
 	r.Use(middleware.Recoverer)
 	r.Use(securityHeaders)
@@ -524,23 +377,10 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 	r.Get("/health", h.HealthHandler)
 	r.Get("/version", h.VersionHandler)
 	r.Get("/key", h.KeyHandler)
-	r.Get("/register/{auth_id}", h.authProvider.RegisterHandler)
-	r.Get("/auth/{auth_id}", h.authProvider.AuthHandler)
-
-	if provider, ok := h.authProvider.(*AuthProviderOIDC); ok {
-		r.Get("/oidc/callback", provider.OIDCCallbackHandler)
-		r.Post("/register/confirm/{auth_id}", provider.RegisterConfirmHandler)
-	}
-
 	r.Get("/apple", h.AppleConfigMessage)
 	r.Get("/apple/{platform}", h.ApplePlatformConfig)
 	r.Get("/windows", h.WindowsConfigMessage)
-
-	// TODO(kristoffer): move swagger into a package
-	r.Get("/swagger", headscale.SwaggerUI)
-	r.Get("/swagger/v1/openapiv2.json", headscale.SwaggerAPIv1)
-
-	r.Post("/verify", h.VerifyHandler)
+	r.Get("/scaletail/v1/client-update", h.ScaleTailClientUpdateHandler)
 
 	if h.cfg.DERP.ServerEnabled {
 		r.HandleFunc("/derp", h.DERPServer.DERPHandler)
@@ -549,10 +389,6 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 		r.HandleFunc("/bootstrap-dns", derpServer.DERPBootstrapDNSHandler(h.state.DERPMap()))
 	}
 
-	r.Route("/api", func(r chi.Router) {
-		r.Use(h.httpAuthenticationMiddleware)
-		r.HandleFunc("/v1/*", grpcMux.ServeHTTP)
-	})
 	// Ping response endpoint: receives HEAD from clients responding
 	// to a PingRequest. The unguessable ping ID serves as authentication.
 	r.Head("/machine/ping-response", h.PingResponseHandler)
@@ -641,7 +477,7 @@ func (h *Headscale) Serve() error {
 			return fmt.Errorf("setting up extrarecord manager: %w", err)
 		}
 
-		h.cfg.TailcfgDNSConfig.ExtraRecords = h.extraRecordMan.Records()
+		h.state.SetExtraDNSRecords(h.extraRecordMan.Records())
 
 		go h.extraRecordMan.Run()
 		defer h.extraRecordMan.Close()
@@ -695,27 +531,6 @@ func (h *Headscale) Serve() error {
 		return fmt.Errorf("changing gRPC socket permission: %w", err)
 	}
 
-	grpcGatewayMux := grpcRuntime.NewServeMux()
-
-	// Make the grpc-gateway connect to grpc over socket
-	grpcGatewayConn, err := grpc.Dial( //nolint:staticcheck // SA1019: deprecated but supported in 1.x
-		h.cfg.UnixSocket,
-		[]grpc.DialOption{
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithContextDialer(util.GrpcSocketDialer),
-		}...,
-	)
-	if err != nil {
-		return fmt.Errorf("setting up gRPC gateway via socket: %w", err)
-	}
-
-	// Connect to the gRPC server over localhost to skip
-	// the authentication.
-	err = v1.RegisterHeadscaleServiceHandler(ctx, grpcGatewayMux, grpcGatewayConn)
-	if err != nil {
-		return fmt.Errorf("registering Headscale API service to gRPC: %w", err)
-	}
-
 	// Start the local gRPC server without TLS and without authentication
 	grpcSocket := grpc.NewServer(
 	// Uncomment to debug grpc communication.
@@ -726,6 +541,54 @@ func (h *Headscale) Serve() error {
 	reflection.Register(grpcSocket)
 
 	errorGroup.Go(func() error { return grpcSocket.Serve(socketListener) })
+
+	var scaleForgeAPIServer *http.Server
+	var scaleForgeAPIListener net.Listener
+	var scaleForgeGatewayConn *grpc.ClientConn
+	if h.cfg.ScaleForge.Socket != "" {
+		if h.cfg.ScaleForge.Socket == h.cfg.UnixSocket {
+			return errors.New("scaleforge.socket must differ from unix_socket")
+		}
+		if h.cfg.ScaleForge.BackendSocket == h.cfg.ScaleForge.Socket ||
+			h.cfg.ScaleForge.BackendSocket == h.cfg.UnixSocket {
+			return errors.New("scaleforge.backend_socket must differ from Headscale listener sockets")
+		}
+		if err := ensureUnixSocketIsAbsent(h.cfg.ScaleForge.Socket); err != nil {
+			return fmt.Errorf("removing old ScaleForge API socket: %w", err)
+		}
+		if err := util.EnsureDir(filepath.Dir(h.cfg.ScaleForge.Socket)); err != nil {
+			return fmt.Errorf("setting up ScaleForge API socket directory: %w", err)
+		}
+
+		scaleForgeAPIListener, err = new(net.ListenConfig).Listen(
+			context.Background(),
+			"unix",
+			h.cfg.ScaleForge.Socket,
+		)
+		if err != nil {
+			return fmt.Errorf("setting up ScaleForge API socket: %w", err)
+		}
+		if err := os.Chmod(h.cfg.ScaleForge.Socket, h.cfg.ScaleForge.SocketPermission); err != nil {
+			return fmt.Errorf("changing ScaleForge API socket permission: %w", err)
+		}
+
+		grpcGatewayMux := grpcRuntime.NewServeMux()
+		scaleForgeGatewayConn, err = grpc.Dial( //nolint:staticcheck // internal Unix socket
+			h.cfg.UnixSocket,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(util.GrpcSocketDialer),
+		)
+		if err != nil {
+			return fmt.Errorf("connecting private ScaleForge gateway: %w", err)
+		}
+		if err := v1.RegisterHeadscaleServiceHandler(ctx, grpcGatewayMux, scaleForgeGatewayConn); err != nil {
+			return fmt.Errorf("registering private ScaleForge gateway: %w", err)
+		}
+
+		scaleForgeAPIServer = h.newScaleForgeAPIServer(grpcGatewayMux)
+		errorGroup.Go(func() error { return scaleForgeAPIServer.Serve(scaleForgeAPIListener) })
+		log.Info().Str("socket", h.cfg.ScaleForge.Socket).Msg("listening on private ScaleForge API socket")
+	}
 
 	//
 	//
@@ -739,62 +602,11 @@ func (h *Headscale) Serve() error {
 
 	//
 	//
-	// gRPC setup
-	//
-
-	// We are sadly not able to run gRPC and HTTPS (2.0) on the same
-	// port because the connection mux does not support matching them
-	// since they are so similar. There is multiple issues open and we
-	// can revisit this if changes:
-	// https://github.com/soheilhy/cmux/issues/68
-	// https://github.com/soheilhy/cmux/issues/91
-
-	var (
-		grpcServer   *grpc.Server
-		grpcListener net.Listener
-	)
-
-	if tlsConfig != nil || h.cfg.GRPCAllowInsecure {
-		log.Info().Msgf("enabling remote gRPC at %s", h.cfg.GRPCAddr)
-
-		grpcOptions := []grpc.ServerOption{
-			grpc.ChainUnaryInterceptor(
-				h.grpcAuthenticationInterceptor,
-				// Uncomment to debug grpc communication.
-				// zerolog.NewUnaryServerInterceptor(),
-			),
-		}
-
-		if tlsConfig != nil {
-			grpcOptions = append(grpcOptions,
-				grpc.Creds(credentials.NewTLS(tlsConfig)),
-			)
-		} else {
-			log.Warn().Msg("gRPC is running without security")
-		}
-
-		grpcServer = grpc.NewServer(grpcOptions...)
-
-		v1.RegisterHeadscaleServiceServer(grpcServer, newHeadscaleV1APIServer(h))
-
-		grpcListener, err = new(net.ListenConfig).Listen(context.Background(), "tcp", h.cfg.GRPCAddr)
-		if err != nil {
-			return fmt.Errorf("binding to TCP address: %w", err)
-		}
-
-		errorGroup.Go(func() error { return grpcServer.Serve(grpcListener) })
-
-		log.Info().
-			Msgf("listening and serving gRPC on: %s", h.cfg.GRPCAddr)
-	}
-
-	//
-	//
 	// HTTP setup
 	//
 	// This is the regular router that we expose
 	// over our main Addr
-	router := h.createRouter(grpcGatewayMux)
+	router := h.createRouter()
 
 	httpServer := &http.Server{
 		Addr:        h.cfg.Addr,
@@ -922,6 +734,13 @@ func (h *Headscale) Serve() error {
 					}
 				}
 
+				if scaleForgeAPIServer != nil {
+					info("shutting down ScaleForge API server")
+					if err := scaleForgeAPIServer.Shutdown(shutdownCtx); err != nil {
+						log.Error().Err(err).Msg("failed to shutdown ScaleForge API server")
+					}
+				}
+
 				info("shutting down main http server")
 
 				err := httpServer.Shutdown(shutdownCtx)
@@ -938,12 +757,6 @@ func (h *Headscale) Serve() error {
 				info("shutting down grpc server (socket)")
 				grpcSocket.GracefulStop()
 
-				if grpcServer != nil {
-					info("shutting down grpc server (external)")
-					grpcServer.GracefulStop()
-					grpcListener.Close()
-				}
-
 				if tailsqlContext != nil {
 					info("shutting down tailsql")
 					tailsqlContext.Done()
@@ -955,9 +768,14 @@ func (h *Headscale) Serve() error {
 				if debugHTTPListener != nil {
 					debugHTTPListener.Close()
 				}
+				if scaleForgeAPIListener != nil {
+					scaleForgeAPIListener.Close()
+				}
+				if scaleForgeGatewayConn != nil {
+					scaleForgeGatewayConn.Close()
+				}
 
 				httpListener.Close()
-				grpcGatewayConn.Close()
 
 				// Stop listening (and unlink the socket if unix type):
 				info("closing socket listener")
@@ -1122,7 +940,7 @@ func (h *Headscale) Change(cs ...change.Change) {
 // The handler serves the Tailscale control protocol including the /key
 // endpoint and /ts2021 Noise upgrade path.
 func (h *Headscale) HTTPHandler() http.Handler {
-	return h.createRouter(grpcRuntime.NewServeMux())
+	return h.createRouter()
 }
 
 // NoisePublicKey returns the server's Noise protocol public key.

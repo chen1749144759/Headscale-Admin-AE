@@ -1,54 +1,12 @@
-# Tags
+# 身份标签
 
-Headscale supports Tailscale tags. Please read [Tailscale's tag documentation](https://tailscale.com/docs/features/tags)
-to learn how tags work and how to use them.
+当前账户密码模式不支持节点身份标签。
 
-Tags can be applied during [node registration](registration.md):
+- ScaleTail 账户节点始终归属于账户绑定的用户网络。
+- 客户端携带 `--advertise-tags` 的账户注册请求会被拒绝。
+- `SetTags` 管理 RPC 返回 `FailedPrecondition`。
+- 预认证 Key、浏览器批准和手工注册不能用于创建 tagged node。
 
-- using the `--advertise-tags` flag, see [web authentication for tagged devices](registration.md#__tabbed_1_2)
-- using a tagged pre authenticated key, see [how to create and use it](registration.md#__tabbed_2_2)
-
-Administrators can manage tags with:
-
-- Headscale CLI
-- [Headscale API](api.md)
-
-## Common operations
-
-### Manage tags for a node
-
-Run `headscale nodes list` to list the tags for a node.
-
-Use the `headscale nodes tag` command to modify the tags for a node. At least one tag is required and multiple tags can
-be provided as comma separated list. The following command sets the tags `tag:server` and `tag:prod` on node with ID 1:
-
-```console
-headscale nodes tag -i 1 -t tag:server,tag:prod
-```
-
-### Convert from personal to tagged node
-
-Use the `headscale nodes tag` command to convert a personal (user-owned) node to a tagged node:
-
-```console
-headscale nodes tag -i <NODE_ID> -t <TAG>
-```
-
-The node is now owned by the special user `tagged-devices` and has the specified tags assigned to it.
-
-### Convert from tagged to personal node
-
-Tagged nodes can return to personal (user-owned) nodes by re-authenticating with:
-
-```console
-tailscale up --login-server <YOUR_HEADSCALE_URL> --advertise-tags= --force-reauth
-```
-
-Usually, a browser window with further instructions is opened. This page explains how to complete the registration on
-your Headscale server and it also prints the Auth ID required to approve the node:
-
-```console
-headscale auth register --user <USER> --auth-id <AUTH_ID>
-```
-
-All previously assigned tags get removed and the node is now owned by the user specified in the above command.
+历史节点的 tags 字段、ACL 中的 tag 语法和相关 protobuf 仍可能存在，用于数据库迁移
+和读取旧数据；它们不构成当前可用的节点注册方式。需要服务身份分组时，应在
+ScaleForge 的账户/分组和 ACL 策略中建模，不要恢复旧认证入口。

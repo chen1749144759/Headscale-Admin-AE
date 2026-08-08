@@ -126,11 +126,12 @@ func (hsdb *HSDatabase) GetUserByID(uid types.UserID) (*types.User, error) {
 
 func GetUserByID(tx *gorm.DB, uid types.UserID) (*types.User, error) {
 	user := types.User{}
-	if result := tx.First(&user, "id = ?", uid); errors.Is(
-		result.Error,
-		gorm.ErrRecordNotFound,
-	) {
+	result := tx.First(&user, "id = ?", uid)
+	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 		return nil, ErrUserNotFound
+	}
+	if result.Error != nil {
+		return nil, fmt.Errorf("finding user by ID: %w", result.Error)
 	}
 
 	return &user, nil
@@ -144,11 +145,12 @@ func (hsdb *HSDatabase) GetUserByOIDCIdentifier(id string) (*types.User, error) 
 
 func GetUserByOIDCIdentifier(tx *gorm.DB, id string) (*types.User, error) {
 	user := types.User{}
-	if result := tx.First(&user, "provider_identifier = ?", id); errors.Is(
-		result.Error,
-		gorm.ErrRecordNotFound,
-	) {
+	result := tx.First(&user, "provider_identifier = ?", id)
+	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 		return nil, ErrUserNotFound
+	}
+	if result.Error != nil {
+		return nil, fmt.Errorf("finding user by OIDC identifier: %w", result.Error)
 	}
 
 	return &user, nil

@@ -5,8 +5,20 @@
 server_url: ${HEADSCALE_SERVER_URL}
 
 listen_addr: 0.0.0.0:8080
-grpc_listen_addr: 0.0.0.0:50443
-grpc_allow_insecure: false
+
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"
+
+scaleforge:
+  socket: /var/run/scaleforge/control/api.sock
+  socket_permission: "0660"
+  backend_socket: /var/run/scaleforge/client/api.sock
+  internal_auth_key_file: /run/secrets/scaleforge_internal_auth_key
+  trust_proxy: ${HEADSCALE_TRUST_PROXY}
+  trusted_proxy_cidrs: ${HEADSCALE_TRUSTED_PROXY_CIDRS}
+  max_nodes_per_account: ${SCALEFORGE_MAX_NODES_PER_ACCOUNT}
+  bootstrap_username: ${SCALEFORGE_BOOTSTRAP_USERNAME}
+  bootstrap_password_file: /run/secrets/scaleforge_bootstrap_password
 
 noise:
   private_key_path: /var/lib/headscale/noise_private.key
@@ -22,10 +34,10 @@ derp:
     region_id: 999
     region_code: headscale
     region_name: Headscale Embedded DERP
-    stun_listen_addr: 0.0.0.0:${DERP_PORT}
+    stun_listen_addr: 0.0.0.0:3478
     domain: ${DERP_DOMAIN}
     private: true
-    verify_clients: false
+    verify_clients: true
     private_key_path: /var/lib/headscale/derp.key
   urls: []
   auto_update_enabled: false
@@ -44,12 +56,13 @@ database:
     conn_max_idle_time_secs: 3600
 
 dns:
+  magic_dns: ${HEADSCALE_MAGIC_DNS}
   base_domain: ${HEADSCALE_DNS_DOMAIN}
-  override_local_dns: true
+  override_local_dns: ${HEADSCALE_DNS_OVERRIDE_LOCAL}
   nameservers:
     global:
-      - 1.1.1.1
-      - 8.8.8.8
+${HEADSCALE_DNS_GLOBAL_YAML}
+${HEADSCALE_DNS_SEARCH_YAML}
 
 log:
   level: ${HEADSCALE_LOG_LEVEL}

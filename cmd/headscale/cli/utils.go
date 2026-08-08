@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +17,6 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/yaml.v3"
@@ -34,7 +32,6 @@ const (
 )
 
 var (
-	errAPIKeyNotSet     = errors.New("HEADSCALE_CLI_API_KEY environment variable needs to be set")
 	errMissingParameter = errors.New("missing parameters")
 )
 
@@ -101,72 +98,30 @@ func newHeadscaleCLIWithConfig() (context.Context, v1.HeadscaleServiceClient, *g
 		grpc.WithBlock(), //nolint:staticcheck // SA1019: deprecated but supported in 1.x
 	}
 
-	address := cfg.CLI.Address
+	address := cfg.UnixSocket
+	log.Debug().Str("socket", address).Msg("connecting to the local Headscale Unix socket")
 
-	// If the address is not set, we assume that we are on the server hosting hscontrol.
-	if address == "" {
-		log.Debug().
-			Str("socket", cfg.UnixSocket).
-			Msgf("HEADSCALE_CLI_ADDRESS environment is not set, connecting to unix socket.")
-
-		address = cfg.UnixSocket
-
-		// Try to give the user better feedback if we cannot write to the headscale
-		// socket.  Note: os.OpenFile on a Unix domain socket returns ENXIO on
-		// Linux which is expected — only permission errors are actionable here.
-		// The actual gRPC connection uses net.Dial which handles sockets properly.
-		socket, err := os.OpenFile(cfg.UnixSocket, os.O_WRONLY, SocketWritePermissions) //nolint
-		if err != nil {
-			if os.IsPermission(err) {
-				cancel()
-
-				return nil, nil, nil, nil, fmt.Errorf(
-					"unable to read/write to headscale socket %q, do you have the correct permissions? %w",
-					cfg.UnixSocket,
-					err,
-				)
-			}
-		} else {
-			socket.Close()
-		}
-
-		grpcOptions = append(
-			grpcOptions,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithContextDialer(util.GrpcSocketDialer),
-		)
-	} else {
-		// If we are not connecting to a local server, require an API key for authentication
-		apiKey := cfg.CLI.APIKey
-		if apiKey == "" {
+	// os.OpenFile on a Unix domain socket normally returns ENXIO. Only a
+	// permission failure is actionable; the actual connection uses net.Dial.
+	socket, err := os.OpenFile(address, os.O_WRONLY, SocketWritePermissions) //nolint
+	if err != nil {
+		if os.IsPermission(err) {
 			cancel()
-
-			return nil, nil, nil, nil, errAPIKeyNotSet
-		}
-
-		grpcOptions = append(grpcOptions,
-			grpc.WithPerRPCCredentials(tokenAuth{
-				token: apiKey,
-			}),
-		)
-
-		if cfg.CLI.Insecure {
-			tlsConfig := &tls.Config{
-				// turn of gosec as we are intentionally setting
-				// insecure.
-				//nolint:gosec
-				InsecureSkipVerify: true,
-			}
-
-			grpcOptions = append(grpcOptions,
-				grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
-			)
-		} else {
-			grpcOptions = append(grpcOptions,
-				grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")),
+			return nil, nil, nil, nil, fmt.Errorf(
+				"unable to read/write to headscale socket %q, do you have the correct permissions? %w",
+				address,
+				err,
 			)
 		}
+	} else {
+		socket.Close()
 	}
+
+	grpcOptions = append(
+		grpcOptions,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(util.GrpcSocketDialer),
+	)
 
 	log.Trace().Caller().Str(zf.Address, address).Msg("connecting via gRPC")
 
@@ -303,22 +258,4 @@ func hasMachineOutputFlag() bool {
 	}
 
 	return false
-}
-
-type tokenAuth struct {
-	token string
-}
-
-// Return value is mapped to request headers.
-func (t tokenAuth) GetRequestMetadata(
-	ctx context.Context,
-	in ...string,
-) (map[string]string, error) {
-	return map[string]string{
-		"authorization": "Bearer " + t.token,
-	}, nil
-}
-
-func (tokenAuth) RequireTransportSecurity() bool {
-	return true
 }

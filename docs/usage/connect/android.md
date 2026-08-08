@@ -1,28 +1,10 @@
-# Connecting an Android client
+# Android 客户端
 
-This documentation has the goal of showing how a user can use the official Android [Tailscale](https://tailscale.com) client with headscale.
+当前版本不支持 Android 客户端。
 
-## Installation
+官方 Tailscale Android 客户端依赖浏览器认证或 auth key，而
+Headscale-Admin-AE 已禁用 OIDC、浏览器批准和预认证 Key。只有实现 ScaleTail
+账户密码 Noise 认证协议的客户端才能接入。
 
-Install the official Tailscale Android client from the [Google Play Store](https://play.google.com/store/apps/details?id=com.tailscale.ipn) or [F-Droid](https://f-droid.org/packages/com.tailscale.ipn/).
-
-## Connect via web authentication
-
-- Open the app and select the settings menu in the upper-right corner
-- Tap on `Accounts`
-- In the kebab menu icon (three dots) in the upper-right corner select `Use an alternate server`
-- Enter your server URL (e.g `https://headscale.example.com`) and follow the instructions
-- The client connects automatically as soon as the node registration is complete on headscale. Until then, nothing is
-  visible in the server logs.
-
-## Connect using a pre authenticated key
-
-- Open the app and select the settings menu in the upper-right corner
-- Tap on `Accounts`
-- In the kebab menu icon (three dots) in the upper-right corner select `Use an alternate server`
-- Enter your server URL (e.g `https://headscale.example.com`). If login prompts open, close it and continue
-- Open the settings menu in the upper-right corner
-- Tap on `Accounts`
-- In the kebab menu icon (three dots) in the upper-right corner select `Use an auth key`
-- Enter your [preauthkey generated from headscale](../../ref/registration.md#pre-authenticated-key)
-- If needed, tap `Log in` on the main screen. You should now be connected to your headscale.
+在 Android 版 ScaleTail 正式发布并完成同协议测试前，不要尝试恢复旧认证入口来绕过
+这一限制。

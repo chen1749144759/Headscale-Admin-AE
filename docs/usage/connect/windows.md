@@ -1,60 +1,31 @@
-# Connecting a Windows client
+# 连接 Windows 节点
 
-This documentation has the goal of showing how a user can use the official Windows [Tailscale](https://tailscale.com) client with headscale.
+Windows 节点必须使用与服务端版本匹配的 ScaleTail 客户端。官方 Tailscale Windows
+客户端不支持本分支的账户密码协议。
 
-!!! info "Instructions on your headscale instance"
+## 登录
 
-    An endpoint with information on how to connect your Windows device
-    is also available at `/windows` on your running instance.
+1. 安装 ScaleTail，并确认 `ScaleTail` 系统服务正在运行。
+2. 打开 ScaleTail 仪表盘的服务端设置。
+3. 填写可信的 HTTPS 控制服务器地址、账户名和密码。
+4. 按需设置设备名称、接受路由和 DNS。
+5. 点击连接，等待页面显示节点在线。
 
-## Installation
+登录直接通过本地服务和加密 Noise 会话完成，不会打开浏览器，不需要 Auth ID、预认证
+Key 或 CMD 命令。
 
-Download the [Official Windows Client](https://tailscale.com/download/windows) and install it.
+## 密码到期
 
-## Configuring the headscale URL
+密码最长有效 90 天。到期后先在 ScaleForge 修改密码，再回到 ScaleTail 使用新密码
+重新登录。修改密码会撤销旧管理会话，并使后续节点控制会话重新证明账户身份。
 
-Open a Command Prompt or Powershell and use Tailscale's login command to connect with your headscale instance (e.g
-`https://headscale.example.com`):
+## 排查
 
-```
-tailscale login --login-server <YOUR_HEADSCALE_URL>
-```
+- `/health` 必须通过 HTTPS 正常访问。
+- 客户端系统时间应准确。
+- ScaleTail 与 Headscale-Admin-AE 应使用同一发布批次的账户协议。
+- ScaleForge 中账户必须启用、未到期并已绑定网络。
+- 服务端日志不应出现 `password_expired`、`account_disabled`、
+  `network_not_assigned` 或 `node_limit_reached`。
 
-Follow the instructions in the opened browser window to finish the configuration.
-
-## Troubleshooting
-
-### Unattended mode
-
-By default, Tailscale's Windows client is only running when the user is logged in. If you want to keep Tailscale running
-all the time, please enable "Unattended mode":
-
-- Click on the Tailscale tray icon and select `Preferences`
-- Enable `Run unattended`
-- Confirm the "Unattended mode" message
-
-See also [Keep Tailscale running when I'm not logged in to my
-computer](https://tailscale.com/docs/how-to/run-unattended).
-
-### Failing node registration
-
-If you are seeing repeated messages like:
-
-```
-[GIN] 2022/02/10 - 16:39:34 | 200 |    1.105306ms |       127.0.0.1 | POST     "/machine/redacted"
-```
-
-in your headscale output, turn on `DEBUG` logging and look for:
-
-```
-2022-02-11T00:59:29Z DBG Machine registration has expired. Sending a authurl to register machine=redacted
-```
-
-This typically means that the registry keys above was not set appropriately.
-
-To reset and try again, it is important to do the following:
-
-1. Shut down the Tailscale service (or the client running in the tray)
-1. Delete Tailscale Application data folder, located at `C:\Users\<USERNAME>\AppData\Local\Tailscale` and try to connect again.
-1. Ensure the Windows node is deleted from headscale (to ensure fresh setup)
-1. Start Tailscale on the Windows machine and retry the login.
+不要用旧版预认证 Key、官方 Tailscale 浏览器登录或手工注册作为兜底。

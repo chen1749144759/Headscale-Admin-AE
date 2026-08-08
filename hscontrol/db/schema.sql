@@ -15,16 +15,7 @@ CREATE TABLE users(
 
   created_at datetime,
   updated_at datetime,
-  deleted_at datetime,
-
-  -- Headscale-Admin-Pro 自定义字段
-  password text,
-  expire datetime,
-  cellphone text,
-  role text,
-  enable text,
-  route text,
-  node text
+  deleted_at datetime
 );
 CREATE INDEX idx_users_deleted_at ON users(deleted_at);
 
@@ -46,6 +37,56 @@ CREATE INDEX idx_users_deleted_at ON users(deleted_at);
 CREATE UNIQUE INDEX idx_provider_identifier ON users(provider_identifier) WHERE provider_identifier IS NOT NULL;
 CREATE UNIQUE INDEX idx_name_provider_identifier ON users(name, provider_identifier);
 CREATE UNIQUE INDEX idx_name_no_provider_identifier ON users(name) WHERE provider_identifier IS NULL;
+
+CREATE TABLE accounts(
+  id integer PRIMARY KEY AUTOINCREMENT,
+  username text NOT NULL,
+  password_hash text NOT NULL,
+  user_id integer,
+  role text NOT NULL DEFAULT "user",
+  enabled numeric NOT NULL DEFAULT true,
+  expires_at datetime,
+  password_changed_at datetime NOT NULL,
+  must_change_password numeric NOT NULL DEFAULT false,
+  password_version integer NOT NULL DEFAULT 1,
+  last_login_at datetime,
+
+  created_at datetime,
+  updated_at datetime,
+  deleted_at datetime,
+
+  CONSTRAINT fk_accounts_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE
+);
+CREATE INDEX idx_accounts_deleted_at ON accounts(deleted_at);
+CREATE UNIQUE INDEX idx_accounts_username ON accounts(username);
+CREATE UNIQUE INDEX idx_accounts_user_id ON accounts(user_id);
+
+CREATE TABLE account_sessions(
+  id integer PRIMARY KEY AUTOINCREMENT,
+  token_hash blob NOT NULL,
+  account_id integer NOT NULL,
+  password_version integer NOT NULL,
+  restricted numeric NOT NULL DEFAULT false,
+  expires_at datetime NOT NULL,
+  last_seen_at datetime NOT NULL,
+  created_at datetime,
+  revoked_at datetime,
+
+  CONSTRAINT fk_account_sessions_account FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX idx_account_sessions_token_hash ON account_sessions(token_hash);
+CREATE INDEX idx_account_sessions_account_id ON account_sessions(account_id);
+CREATE INDEX idx_account_sessions_expires_at ON account_sessions(expires_at);
+
+CREATE TABLE account_password_histories(
+  id integer PRIMARY KEY AUTOINCREMENT,
+  account_id integer NOT NULL,
+  password_hash text NOT NULL,
+  created_at datetime NOT NULL,
+
+  CONSTRAINT fk_account_password_histories_account FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_account_password_histories_account_id ON account_password_histories(account_id);
 
 CREATE TABLE pre_auth_keys(
   id integer PRIMARY KEY AUTOINCREMENT,
@@ -122,21 +163,8 @@ CREATE TABLE database_versions(
   updated_at datetime
 );
 
--- ================== Headscale-Admin-Pro 自定义表 ==================
-CREATE TABLE acl(
-  id integer PRIMARY KEY AUTOINCREMENT,
-  acl text,
-  user_id integer,
-  CONSTRAINT fk_acl_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+CREATE TABLE runtime_settings(
+  key text PRIMARY KEY,
+  value text NOT NULL,
+  updated_at datetime NOT NULL
 );
-CREATE INDEX idx_acl_user_id ON acl(user_id);
-
-CREATE TABLE log(
-  id integer PRIMARY KEY AUTOINCREMENT,
-  user_id integer,
-  content text,
-  created_at datetime,
-  CONSTRAINT fk_log_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-);
-CREATE INDEX idx_log_user_id ON log(user_id);
--- ================== 自定义表结束 ==================

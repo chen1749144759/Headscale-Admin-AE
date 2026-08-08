@@ -3,191 +3,162 @@
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![Base](https://img.shields.io/badge/Base-headscale%20v0.28.0-326CE5)](https://github.com/juanfont/headscale/releases/tag/v0.28.0)
 [![Backports](https://img.shields.io/badge/Backports-headscale%20v0.29.2-7C3AED)](https://github.com/juanfont/headscale/releases/tag/v0.29.2)
-[![Tailscale Lib](https://img.shields.io/badge/tailscale.com-v1.96.5-4D7CFE)](https://github.com/tailscale/tailscale)
-[![Database](https://img.shields.io/badge/Database-SQLite%20%7C%20PostgreSQL-4169E1)](#部署难度)
+[![Database](https://img.shields.io/badge/Database-SQLite%20%7C%20PostgreSQL-4169E1)](#数据库与迁移)
 
-Headscale-Admin-AE 是基于官方 headscale 裂变的增强控制服务，服务于 ScaleForge 管理平台和 ScaleTail 客户端场景。它负责控制面、节点注册、网络地图、路由、ACL、DERP 配置和数据库扩展；图形化管理界面由 ScaleForge 提供。
+Headscale-Admin-AE 是服务于 ScaleTail 和 ScaleForge 的自托管控制面。项目基于
+`juanfont/headscale v0.28.0` 裂变维护，并按审计结果定向回补后续版本的稳定性修复；
+它不是官方 headscale 的直接替代包，也不继续兼容官方的多套登录入口。
 
 仓库地址：[chen1749144759/Headscale-Admin-AE](https://github.com/chen1749144759/Headscale-Admin-AE)
 
-## 版本定位
+## 当前认证模型
 
-| 项目项 | 当前说明 |
-|---|---|
-| 裂变来源 | 基于官方 `juanfont/headscale v0.28.0` 的 AE 增强分支继续维护 |
-| 当前对标 | 定向回补官方 headscale `v0.29.2` 中对本项目有价值的注册、重连、策略并发和稳定性修复 |
-| 升级策略 | 不直接整仓升级到 v0.29.2，优先保留 AE 自定义能力，再按审计结果回补关键修复 |
-| Go 版本 | `go.mod` 使用 Go `1.26.1` |
-| Tailscale 依赖 | `tailscale.com v1.96.5` |
-| 配套管理平台 | `ScaleForge` |
-| 推荐客户端 | `ScaleTail` |
-| 当前 Docker 镜像 | `chenzeshi/headscale-admin-ae:20260727-387705f` |
+本分支只支持一套面向用户的身份体系：**ScaleForge 账户名和密码**。
 
-本项目仍保持 headscale 控制服务定位，二进制和 CLI 形态以 headscale 为核心；ScaleForge 通过共享数据库和 API 与它协同工作。
+- ScaleForge 管理后台和 ScaleTail 节点使用同一账户身份。
+- 密码使用 bcrypt 保存，长度必须为 12 至 72 字节。
+- 密码最长有效期固定为 90 天；到期后只能先修改密码，再恢复管理操作和节点登录。
+- 新密码不能复用当前密码和最近四个历史密码；管理员重置会要求账户下次登录立即修改临时密码。
+- 修改或重置密码会提升密码版本、撤销旧管理会话，并使节点重新完成账户证明。
+- 新的 ScaleTail 控制会话必须在加密的 Noise 会话内提交账户证明，密码不会作为节点长期密钥保存到服务端。
+- 账户可单独禁用、设置账户到期时间、绑定网络并限制可注册节点数量。
+- 账户认证节点的有效期不会超过“密码修改时间 + 90 天”或账户到期时间中的较早值。
 
-## 自实现功能
+```text
+ScaleTail
+  | HTTPS + TS2021 Noise + account proof
+  v
+Headscale-Admin-AE
+  | private Unix socket
+  v
+ScaleForge
+```
 
-- 扩展 `users` 表，支持管理平台登录密码、角色、过期时间、启用状态、节点配额和路由权限。
-- 支持数据库 ACL 模式，ScaleForge 可以在线读取、编辑和保存 ACL/HuJSON 策略。
-- 支持节点在用户/分组之间迁移，并通知在线节点刷新网络地图。
-- Docker 配置模板支持环境变量渲染，适合与 ScaleForge 一键部署。
-- 保留并增强内置 DERP/DERP map 相关能力，方便私有化部署。
-- 支持 PostgreSQL 和 SQLite 两种数据库。
-- 启动时同步管理平台需要的自定义表和索引，降低 ScaleForge 首次启动缺表风险。
-- 回补官方 headscale v0.29.1 中影响注册、重注册、预认证密钥、NodeStore、数据库迁移和 IP 分配稳定性的关键修复。
-- 回补官方 headscale v0.29.2 的策略读锁/缓存并发、网络图异常节点隔离、无效 FQDN 启动体检、注册错误响应和 `/ts2021` WebSocket GET 兼容修复。
+### 已禁用的旧入口
 
-## 新增/扩展数据结构
+以下方式不属于当前产品协议，不能用于新节点接入或远程管理：
 
-### users 表扩展字段
+- 预认证 Key（pre-auth key / auth key）。
+- Headscale API Key。
+- OIDC 登录和浏览器授权页面。
+- `headscale auth register` / `headscale nodes register` 手工批准流程。
+- 暴露到公网的 REST 管理 API 或远程 gRPC 管理端口。
 
-| 字段 | 用途 |
-|---|---|
-| `password` | 管理平台登录密码哈希 |
-| `expire` | 账户过期时间 |
-| `cellphone` | 联系方式 |
-| `role` | 管理平台角色 |
-| `enable` | 账户启用状态 |
-| `route` | 路由权限 |
-| `node` | 节点配额 |
+`headscale preauthkeys` 与 `headscale apikeys` CLI 入口已经移除；对应 gRPC CRUD
+返回 `FailedPrecondition`。仓库仍保留部分旧数据库表、模型和 protobuf 定义，仅用于
+读取旧数据库、保持迁移顺序和协议结构稳定，**不表示这些功能仍可使用**。
 
-### 管理平台和观测表
+## 管理边界
 
-| 表名 | 用途 |
-|---|---|
-| `acl` | 数据库 ACL/HuJSON 策略 |
-| `log` | 管理平台操作日志 |
-| `client_policies` | ScaleTail 客户端策略 |
-| `client_policy_states` | 客户端策略应用状态 |
-| `traffic_samples` | 原始流量采样 |
-| `traffic_hourly` | 小时级流量聚合 |
-| `traffic_daily` | 日级流量聚合 |
-| `flow_summaries` | 请求/连接摘要 |
-| `node_ip_observations` | 节点公网 IP 观测 |
-| `security_events` | 安全事件 |
-| `trusted_networks` | 可信网络 |
-| `risk_rules` | 风险规则 |
-| `client_releases` | ScaleTail 客户端版本、强制/建议更新策略及 OTA 哈希/签名元数据 |
+公网监听地址只提供 ScaleTail 控制协议、健康检查、版本、更新检查和启用后的内置
+DERP，不挂载 `/api/v1`、Swagger 或远程 gRPC 管理接口。
 
-这些表与 ScaleForge 后端 SQL 保持一致。Headscale-Admin-AE 负责在控制服务启动时兜底创建，ScaleForge 负责业务读写和页面展示。
+管理通道分为三个 Unix Domain Socket：
 
-## 对标官方 v0.29.2 的关键回补
+| Socket | 用途 | 建议权限 |
+|---|---|---:|
+| `unix_socket` | Headscale 本机管理 gRPC，仅供同主机受信任管理员使用 | `0770` |
+| `scaleforge.socket` | Headscale 向 ScaleForge 提供的私有管理 HTTP 网关 | `0660` |
+| `scaleforge.backend_socket` | Headscale 转发已认证节点的上报、策略和更新请求 | 由 ScaleForge 管理 |
 
-- MachineKey 级注册互斥，降低并发注册导致重复节点的风险。
-- NodeKey 与 MachineKey 归属校验，避免旧 NodeKey 被错误复用。
-- 已存在节点重启时尽量复用原 NodeKey，避免误消耗新的预认证密钥。
-- 过期节点重新注册时重新校验预认证密钥。
-- 一次性预认证密钥使用逻辑更稳，降低并发重复消费风险。
-- 未知预认证密钥按不存在处理，错误语义更清楚。
-- NodeStore 写库失败时回滚内存状态，避免数据库和内存不一致。
-- 数据库迁移补齐零值过期时间转 `NULL`、`tags='null'` 用户归属恢复、API key 主键查询等修复。
-- IP 分配器补齐 `/32`、`/128` 等极小网段处理，避免异常前缀导致 panic。
-- DERP map shuffle 前复制 region，避免修改共享配置。
-- OIDC cookie 使用更安全的 SameSite 策略和更短名称。
-- IPv4 `/32` 反向 DNS 生成逻辑补齐。
-- 策略管理器读路径使用读锁，并将高并发缓存切换为并发 Map，降低网络图生成期间的锁竞争和重连风暴。
-- 单个节点名称/FQDN 异常时记录告警并跳过该节点，避免一次坏数据拖垮整张网络图。
-- 启动时只读扫描历史节点名称，明确提示需要重命名的节点，不在启动阶段擅自修改数据库。
-- 网络图和节点注册失败会返回明确 HTTP 错误，避免客户端收到空 200 后持续 `unexpected EOF` 重试。
-- `/ts2021` 同时接受 GET 和 POST，兼容 WebSocket/JS/WASM 控制客户端。
+部署时只把 `scaleforge.socket` 挂载到 ScaleForge 后端容器，不能映射为 TCP 端口，
+也不能交给反向代理公开。Socket 所在目录和容器用户组是管理边界的一部分。
 
-## 部署难度
+两个 ScaleForge 私有方向都必须配置同一个 `scaleforge.internal_auth_key_file`。密钥至少
+32 字节，只从 Docker/Kubernetes secret 读取。每个请求使用 HMAC-SHA256 绑定方法、路径、
+查询、正文、时间戳、nonce、授权头及节点/用户上下文；超过 60 秒或重复 nonce 的请求会被拒绝。
 
-| 场景 | 难度 | 说明 |
-|---|---:|---|
-| 随 ScaleForge Docker Compose 部署 | 中 | 推荐方式。配置集中，数据库、管理平台、控制服务一起启动。 |
-| 单独部署 Headscale-Admin-AE | 中高 | 需要手动准备配置文件、数据库、证书/DERP、API key 和 systemd/Docker 运行环境。 |
-| 从官方 headscale 迁移 | 高 | 需要谨慎处理数据库结构、ACL 模式、用户字段、预认证密钥和客户端重连状态。 |
-| 继续合并官方新版本 | 高 | 需要逐项审计上游改动，避免破坏 AE 自定义数据库、Docker、DERP 和管理平台契约。 |
+启用 `scaleforge.trust_proxy` 时还必须设置最小范围的
+`scaleforge.trusted_proxy_cidrs`。只有来自这些 CIDR 的反向代理才允许提供客户端 IP 头，
+不要在生产环境填写 `0.0.0.0/0` 或 `::/0`。
 
-部署前必须确认：
+首个管理账户仅在账户表为空时创建。初始密码必须通过 Docker/Kubernetes secret
+文件传入 `scaleforge.bootstrap_password_file`，不要写进 YAML、Compose、镜像、日志
+或 Git 仓库。
 
-- ScaleForge 和 Headscale-Admin-AE 使用同一个数据库。
-- 数据库账号具备创建表、添加字段、创建索引的权限。
-- `server_url` 必须与 ScaleTail 客户端连接页填写的控制服务器地址一致。
-- 如果使用 DERP/STUN，需要确认公网端口、防火墙和域名解析。
-- 如果启用数据库 ACL，配置文件中应使用对应策略模式。
+## 旧版本迁移
 
-## 本地构建
+升级前必须备份数据库、配置、Noise 私钥和 DERP 私钥。
+
+1. 启动迁移会把旧 `users` 扩展字段转换为独立的 `accounts` 与
+   `account_sessions` 表。
+2. 迁移账户会被标记为必须修改密码；旧节点只要不是 `password` 注册方式就会到期。
+3. 旧版不受支持的密码哈希不会被误当成明文，迁移会失败并要求管理员先重置密码。
+4. 升级后在 ScaleForge 完成密码修改，再使用新版 ScaleTail 重新进行账户登录。
+5. 不要尝试用旧预认证 Key、API Key、OIDC 或手工注册恢复节点。
+6. 0.0.8 以前的 ScaleTail 无法验证新的账户协议和 OTA v3；需先手工覆盖安装一次 0.0.8。
+
+保留 PostgreSQL/SQLite 数据卷进行增量迁移，不要执行会删除数据卷的
+`docker compose down -v`。
+
+## 内置 DERP
+
+推荐使用随控制面部署的内置 DERP，默认生产组合为：
+
+```yaml
+derp:
+  server:
+    enabled: true
+    verify_clients: true
+    stun_listen_addr: 0.0.0.0:3478
+    private_key_path: /var/lib/headscale/derp.key
+  urls: []
+  auto_update_enabled: false
+```
+
+- `server_url` 必须使用客户端信任的 HTTPS 证书，DERP 域名和端口必须可从公网访问。
+- `verify_clients: true` 只允许本控制面的有效节点使用中继。
+- `urls: []` 和 `auto_update_enabled: false` 表示不混入公共 DERP map。
+- DERP 私钥必须持久化，并且不能与 Noise 私钥共用。
+- 至少开放 DERP HTTPS 端口和 STUN `UDP/3478`。
+- 单内置 DERP 是单点故障；需要高可用时应另行规划多个受控 DERP region。
+
+详细规则见 [DERP 文档](docs/ref/derp.md)。
+
+## 数据库与迁移
+
+支持 SQLite 和 PostgreSQL。ScaleForge 组合部署使用 PostgreSQL，并共享同一套业务
+数据；控制面启动时会增量补齐账户、会话及 ScaleForge 配套表结构。
+
+独立部署时，Headscale 数据库角色需要拥有其控制面 schema，才能执行 GORM 增量迁移。
+ScaleForge 组合部署会由 `db-bootstrap` 建立 Headscale schema owner、ScaleForge NOLOGIN
+owner 和两个相互独立的运行角色；平台迁移使用管理员角色，ScaleForge 运行角色不具有
+DDL 权限，也不能读取密码哈希。迁移失败时服务应停止，不要绕过错误继续提供部分可用的控制面。
+
+## 构建与验证
 
 ```bash
-git clone https://github.com/chen1749144759/Headscale-Admin-AE.git
-cd Headscale-Admin-AE
+go test ./...
 go build -trimpath -o headscale ./cmd/headscale
 ```
 
-查看版本：
+启动前至少确认：
 
-```bash
-./headscale version
-```
+- `server_url` 与 ScaleTail 填写的 HTTPS 控制地址一致。
+- 三个 Unix socket 路径不同，且只挂载给对应容器。
+- Bootstrap 密码与内部 HMAC 密钥来自不同的 secret 文件，且均未写入配置或镜像。
+- 可信代理 CIDR 只包含实际 TLS 反向代理网络。
+- 数据库迁移日志无错误。
+- 内置 DERP 的域名、证书、TCP 端口和 `UDP/3478` 可达。
+- 旧节点已使用新版 ScaleTail 完成账户重新登录。
 
-运行测试：
+## 版本定位
 
-```bash
-go test ./hscontrol/db
-```
+| 项目 | 当前说明 |
+|---|---|
+| 裂变来源 | `juanfont/headscale v0.28.0` |
+| 对标版本 | 定向回补 headscale `v0.29.2` 的注册、NodeStore、策略并发和稳定性修复 |
+| Go | `go.mod` 指定的 Go 工具链 |
+| 管理平台 | ScaleForge |
+| 客户端 | ScaleTail |
 
-## Docker 部署与升级
-
-推荐通过 ScaleForge 仓库的 Compose 文件部署，固定使用：
-
-```dotenv
-AE_VERSION=20260727-387705f
-```
-
-首次部署和升级步骤参见 [ScaleForge Docker Compose 文档](https://github.com/chen1749144759/ScaleForge#docker-compose-首次部署)。控制服务、ScaleForge 和 PostgreSQL 必须使用同一套数据库配置；不要额外启动一个指向不同数据库的 Headscale 实例。
-
-单独验证镜像可执行文件：
-
-```bash
-docker pull chenzeshi/headscale-admin-ae:20260727-387705f
-docker run --rm chenzeshi/headscale-admin-ae:20260727-387705f headscale version
-```
-
-生产升级时：
-
-1. 先备份 PostgreSQL 和 Headscale 配置、状态目录。
-2. 保留 PostgreSQL、Headscale 数据卷，不执行 `docker compose down -v`。
-3. 更新 `AE_VERSION` 后执行 `docker compose pull headscale` 和 `docker compose up -d headscale`。
-4. 确认 `curl -fsS http://127.0.0.1:8080/health` 返回成功。
-5. 检查 `docker compose logs --tail=100 headscale`，确认数据库迁移、ACL、DERP 和服务 URL 没有报错。
-6. 使用现有 ScaleTail 节点验证重连、节点列表、路由宣告和网络互通。
-
-本项目会在启动时增量补齐 ScaleForge 配套表结构，但不会要求清空现有数据卷。数据库账号缺少 DDL 权限时，容器可能启动但新增平台能力不可用，因此健康检查之后仍需检查启动日志。
-
-## 三件套关系
-
-```text
-ScaleTail 客户端
-  |
-  | Tailscale/headscale 控制协议
-  v
-Headscale-Admin-AE
-  |
-  | 共享数据库 + API
-  v
-ScaleForge 管理平台
-```
-
-Headscale-Admin-AE 是控制面；ScaleForge 是管理面；ScaleTail 是客户端。三者一起使用时，普通用户不需要直接操作 headscale CLI，也不需要在客户端 CMD 中手动执行连接命令。
-
-## 当前已验证
-
-- `go test ./hscontrol/db` 通过。
-- PostgreSQL/SQLite 两套自定义表创建逻辑已核对。
-- `flow_summaries` 旧表补列逻辑已核对。
-- ScaleForge 新增的流量、策略、安全审计表已在本项目同步。
-
-## 已知边界
-
-- 当前不是官方 headscale v0.29.2 的整仓升级版本，而是 v0.28.0 AE 分支上的定向回补版本。
-- 与 ScaleForge 强绑定的自定义表不属于官方 headscale 标准 schema。
-- 继续追上游版本时必须先审计注册、数据库迁移、NodeStore、DERP、ACL 和 Docker 模板差异。
+继续同步上游时必须逐项审计控制协议、数据库迁移、NodeStore、ACL、DERP 和
+ScaleForge 私有接口，不能直接整仓覆盖。
 
 ## 交流学习
 
-欢迎加入 ScaleForge 交流群，一起交流自建 Headscale、ScaleTail、ScaleForge 的部署、使用和二次开发经验。
+欢迎加入 ScaleForge 交流群，一起交流自建 Headscale、ScaleTail、ScaleForge 的
+部署、使用和二次开发经验。
 
 群号：`1041671099`
 
@@ -195,11 +166,7 @@ Headscale-Admin-AE 是控制面；ScaleForge 是管理面；ScaleTail 是客户�
 
 ## 打赏
 
-如果这个项目帮你节省了部署和维护时间，可以请作者喝杯咖啡。打赏二维码维护在 ScaleForge 仓库中：
-
 ![打赏](https://raw.githubusercontent.com/chen1749144759/ScaleForge/main/docs/screenshots/donate.jpg)
-
-感谢支持，项目会继续围绕自建 Headscale/ScaleTail 网络的易用性、稳定性和安全可视化迭代。
 
 ## 致谢
 

@@ -1,153 +1,69 @@
-# Getting started
+# 快速开始
 
-This page helps you get started with headscale and provides a few usage examples for the headscale command line tool
-`headscale`.
+本页适用于 Headscale-Admin-AE、ScaleForge 与 ScaleTail 组合部署。官方 headscale 的
+OIDC、预认证 Key、浏览器批准和 API Key 教程不适用于本分支。
 
-!!! note "Prerequisites"
+## 1. 准备服务端
 
-    - Headscale is installed and running as system service. Read the [setup section](../setup/requirements.md) for
-      installation instructions.
-    - The configuration file exists and is adjusted to suit your environment, see
-      [Configuration](../ref/configuration.md) for details.
-    - Headscale is reachable from the Internet. Verify this by visiting the health endpoint:
-      https://headscale.example.com/health
-    - The Tailscale client is installed, see [Client and operating system support](../about/clients.md) for more
-      information.
+- 为控制地址配置客户端信任的 HTTPS 证书。
+- 准备 SQLite 或 PostgreSQL，并确保数据库账户具有迁移所需 DDL 权限。
+- 为 Noise 私钥、DERP 私钥和数据库目录配置持久化卷。
+- 为初始 ScaleForge 管理账户准备 secret 密码文件。
+- 私有挂载三个不同的 Unix socket 路径，不要映射为 TCP 端口。
 
-## Getting help
+推荐通过 ScaleForge 仓库提供的 Docker Compose 一起部署。升级时保留数据库和密钥
+数据卷，禁止执行 `docker compose down -v`。
 
-The `headscale` command line tool provides built-in help. To show available commands along with their arguments and
-options, run:
+## 2. 检查服务
 
-=== "Native"
-
-    ```shell
-    # Show help
-    headscale help
-
-    # Show help for a specific command
-    headscale <COMMAND> --help
-    ```
-
-=== "Container"
-
-    ```shell
-    # Show help
-    docker exec -it headscale \
-      headscale help
-
-    # Show help for a specific command
-    docker exec -it headscale \
-      headscale <COMMAND> --help
-    ```
-
-!!! note "Manage headscale from another local user"
-
-    By default only the user `headscale` or `root` will have the necessary permissions to access the unix socket
-    (`/var/run/headscale/headscale.sock`) that is used to communicate with the service. In order to be able to
-    communicate with the headscale service you have to make sure the unix socket is accessible by the user that runs
-    the commands. In general you can achieve this by any of the following methods:
-
-    - using `sudo`
-    - run the commands as user `headscale`
-    - add your user to the `headscale` group
-
-    To verify you can run the following command using your preferred method:
-
-    ```shell
-    headscale users list
-    ```
-
-## Manage headscale users
-
-In headscale, a node (also known as machine or device) is [typically assigned to a headscale
-user](../ref/registration.md#identity-model). Such a headscale user[^1] may have many nodes assigned to them and can be
-managed with the `headscale users` command. Invoke the built-in help for more information: `headscale users --help`.
-
-### Create a headscale user
-
-=== "Native"
-
-    ```shell
-    headscale users create <USER>
-    ```
-
-=== "Container"
-
-    ```shell
-    docker exec -it headscale \
-      headscale users create <USER>
-    ```
-
-### List existing headscale users
-
-=== "Native"
-
-    ```shell
-    headscale users list
-    ```
-
-=== "Container"
-
-    ```shell
-    docker exec -it headscale \
-      headscale users list
-    ```
-
-## Register a node
-
-One has to [register a node](../ref/registration.md) first to use headscale as coordination server with Tailscale. The
-following examples work for the Tailscale client on Linux/BSD operating systems. Alternatively, follow the instructions
-to connect [Android](connect/android.md), [Apple](connect/apple.md) or [Windows](connect/windows.md) devices. Read
-[registration methods](../ref/registration.md) for an overview of available registration methods.
-
-### [Web authentication](../ref/registration.md#web-authentication)
-
-On a client machine, run the `tailscale up` command and provide the FQDN of your headscale instance as argument:
-
-```shell
-tailscale up --login-server <YOUR_HEADSCALE_URL>
+```bash
+curl -fsS https://control.example.com/health
 ```
 
-Usually, a browser window with further instructions is opened. This page explains how to complete the registration on
-your headscale server and it also prints the Auth ID required to approve the node:
+随后检查 Headscale 启动日志，确认账户迁移、数据库表、ACL 和 DERP map 均无错误。
 
-=== "Native"
+本机管理命令通过 Unix socket 执行：
 
-    ```shell
-    headscale auth register --user <USER> --auth-id <AUTH_ID>
-    ```
-
-=== "Container"
-
-    ```shell
-    docker exec -it headscale \
-      headscale auth register --user <USER> --auth-id <AUTH_ID>
-    ```
-
-### [Pre authenticated key](../ref/registration.md#pre-authenticated-key)
-
-It is also possible to generate a preauthkey and register a node non-interactively. First, generate a preauthkey on the
-headscale instance. By default, the key is valid for one hour and can only be used once (see `headscale preauthkeys --help` for other options):
-
-=== "Native"
-
-    ```shell
-    headscale preauthkeys create --user <USER_ID>
-    ```
-
-=== "Container"
-
-    ```shell
-    docker exec -it headscale \
-      headscale preauthkeys create --user <USER_ID>
-    ```
-
-The command returns the preauthkey on success which is used to connect a node to the headscale instance via the
-`tailscale up` command:
-
-```shell
-tailscale up --login-server <YOUR_HEADSCALE_URL> --authkey <YOUR_AUTH_KEY>
+```bash
+headscale users list
+headscale nodes list
 ```
 
-[^1]: [Ensure that the Headscale username does not end with `@`.](../ref/oidc.md#reference-a-user-in-the-policy)
+远程 gRPC、REST 管理 API 和 API Key 均不受支持。
+
+## 3. 创建账户
+
+首次启动且账户表为空时，Headscale 会使用
+`scaleforge.bootstrap_username` 和 `scaleforge.bootstrap_password_file` 创建首个
+管理账户。Bootstrap 密码必须来自 secret 文件。
+
+登录 ScaleForge 后：
+
+1. 立即修改初始密码。
+2. 创建普通账户或管理账户。
+3. 将账户绑定到正确网络。
+4. 按需配置账户到期时间和节点数量。
+
+密码每 90 天必须更新一次。
+
+## 4. 连接 ScaleTail
+
+在新版 ScaleTail 中填写：
+
+- HTTPS 控制服务器地址。
+- 账户名。
+- 账户密码。
+- 设备名称及需要的路由选项。
+
+客户端通过 Noise 会话直接完成账户证明，不会打开浏览器，也不需要管理员复制 Auth
+ID 或生成预认证 Key。
+
+## 5. 验证
+
+- ScaleForge 中账户和节点归属正确。
+- `headscale nodes list` 显示节点为在线。
+- 节点注册方式为 `password`。
+- 节点有效期不超过账户密码期限。
+- 直连、DERP 回退、子网路由和 DNS 按部署策略工作。
+
+旧节点升级后必须重新账户登录，不能继续使用旧 Key/OIDC/手工批准流程。

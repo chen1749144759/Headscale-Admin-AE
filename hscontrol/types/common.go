@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -221,76 +222,20 @@ func (r AuthID) Validate() error {
 	return nil
 }
 
-// SSHCheckBinding identifies the (source, destination) node pair an SSH
-// check-mode auth request is bound to. It is captured at HoldAndDelegate
-// time so the follow-up request and OIDC callback can verify that no
-// other (src, dst) pair has been substituted via tampered URL parameters.
-type SSHCheckBinding struct {
-	SrcNodeID NodeID
-	DstNodeID NodeID
-}
-
-// PendingRegistrationConfirmation captures the server-side state needed
-// to finalise a node registration after the user has confirmed it on
-// the OIDC interstitial. The OIDC callback resolves the user identity
-// and node expiry, stores them on the cached AuthRequest, and renders
-// a confirmation page; only when the user POSTs the confirmation form
-// does the actual node registration run.
-//
-// CSRF is a one-shot per-session token that the OIDC callback set
-// both as a cookie and as a hidden form field. The confirm POST
-// handler refuses to proceed unless the cookie and form values match.
-type PendingRegistrationConfirmation struct {
-	UserID     uint
-	NodeExpiry *time.Time
-	CSRF       string
-}
-
-// AuthRequest represents a pending authentication request from a user or a
-// node. It carries the minimum data needed to either complete a node
-// registration (regData populated) or an SSH check-mode auth (sshBinding
-// populated), and signals the verdict via the finished channel. The closed
-// flag guards FinishAuth against double-close.
+// AuthRequest represents one pending account-password node registration and
+// signals its verdict to the waiting register request. The closed flag guards
+// FinishAuth against double-close.
 //
 // AuthRequest is always handled by pointer so the channel and atomic flag
 // have a single canonical instance even when stored in caches that
 // internally copy values.
 type AuthRequest struct {
-	// regData is populated for node-registration flows (interactive web
-	// or OIDC). It carries the cached registration payload that the
-	// auth callback uses to promote this request into a real node.
-	//
-	// nil for non-registration flows. Use RegistrationData() to read it
-	// safely.
-	regData *RegistrationData
-
-	// sshBinding is populated for SSH check-mode flows. It captures the
-	// (src, dst) node pair the request was minted for so the follow-up
-	// and OIDC callback can refuse to record a verdict for any other
-	// pair.
-	//
-	// nil for non-SSH-check flows. Use SSHCheckBinding() to read it
-	// safely.
-	sshBinding *SSHCheckBinding
-
-	// pendingConfirmation is populated by the OIDC callback for the
-	// node-registration flow once the user identity has been resolved
-	// but before the user has explicitly confirmed the registration on
-	// the interstitial. The /register/confirm POST handler reads it to
-	// finalise the registration without re-running the OIDC flow.
-	pendingConfirmation *PendingRegistrationConfirmation
-
-	finished chan AuthVerdict
-	closed   *atomic.Bool
-}
-
-// NewAuthRequest creates a pending auth request with no payload, suitable
-// for non-registration flows that only need a verdict channel.
-func NewAuthRequest() *AuthRequest {
-	return &AuthRequest{
-		finished: make(chan AuthVerdict, 1),
-		closed:   &atomic.Bool{},
-	}
+	regData      *RegistrationData
+	finished     chan AuthVerdict
+	closed       *atomic.Bool
+	claimed      *atomic.Bool
+	finalMu      sync.RWMutex
+	finalVerdict *AuthVerdict
 }
 
 // NewRegisterAuthRequest creates a pending auth request carrying the
@@ -301,21 +246,7 @@ func NewRegisterAuthRequest(data *RegistrationData) *AuthRequest {
 		regData:  data,
 		finished: make(chan AuthVerdict, 1),
 		closed:   &atomic.Bool{},
-	}
-}
-
-// NewSSHCheckAuthRequest creates a pending auth request bound to a
-// specific (src, dst) SSH check-mode pair. The follow-up handler and
-// OIDC callback must verify their incoming request matches this binding
-// before recording any verdict.
-func NewSSHCheckAuthRequest(src, dst NodeID) *AuthRequest {
-	return &AuthRequest{
-		sshBinding: &SSHCheckBinding{
-			SrcNodeID: src,
-			DstNodeID: dst,
-		},
-		finished: make(chan AuthVerdict, 1),
-		closed:   &atomic.Bool{},
+		claimed:  &atomic.Bool{},
 	}
 }
 
@@ -330,15 +261,20 @@ func (rn *AuthRequest) RegistrationData() *RegistrationData {
 	return rn.regData
 }
 
-// SSHCheckBinding returns the (src, dst) node pair an SSH check-mode
-// auth request is bound to. It panics if called on an AuthRequest that
-// was not created via NewSSHCheckAuthRequest.
-func (rn *AuthRequest) SSHCheckBinding() *SSHCheckBinding {
-	if rn.sshBinding == nil {
-		panic("SSHCheckBinding can only be used in SSH check-mode requests")
+// RegistrationDataOK returns the cached registration payload without
+// panicking on a malformed cache entry.
+func (rn *AuthRequest) RegistrationDataOK() (*RegistrationData, bool) {
+	if rn.regData == nil {
+		return nil, false
 	}
 
-	return rn.sshBinding
+	return rn.regData, true
+}
+
+// TryClaimRegistration atomically marks a registration auth ID as consumed.
+// Only one callback or credential request may create/update a node from it.
+func (rn *AuthRequest) TryClaimRegistration() bool {
+	return rn.IsRegistration() && !rn.claimed.Swap(true)
 }
 
 // IsRegistration reports whether this auth request carries registration
@@ -347,33 +283,13 @@ func (rn *AuthRequest) IsRegistration() bool {
 	return rn.regData != nil
 }
 
-// IsSSHCheck reports whether this auth request is bound to an SSH
-// check-mode (src, dst) pair (i.e. it was created via
-// NewSSHCheckAuthRequest).
-func (rn *AuthRequest) IsSSHCheck() bool {
-	return rn.sshBinding != nil
-}
-
-// SetPendingConfirmation marks this AuthRequest as having an
-// OIDC-resolved user that is waiting to confirm the registration on
-// the interstitial. The OIDC callback should call this and then render
-// the confirmation page; the /register/confirm POST handler reads the
-// stored UserID/NodeExpiry to finish the registration.
-func (rn *AuthRequest) SetPendingConfirmation(p *PendingRegistrationConfirmation) {
-	rn.pendingConfirmation = p
-}
-
-// PendingConfirmation returns the pending OIDC-resolved registration
-// state captured by SetPendingConfirmation, or nil if no OIDC callback
-// has yet resolved an identity for this AuthRequest.
-func (rn *AuthRequest) PendingConfirmation() *PendingRegistrationConfirmation {
-	return rn.pendingConfirmation
-}
-
 func (rn *AuthRequest) FinishAuth(verdict AuthVerdict) {
 	if rn.closed.Swap(true) {
 		return
 	}
+	rn.finalMu.Lock()
+	rn.finalVerdict = &verdict
+	rn.finalMu.Unlock()
 
 	select {
 	case rn.finished <- verdict:
@@ -381,6 +297,19 @@ func (rn *AuthRequest) FinishAuth(verdict AuthVerdict) {
 	}
 
 	close(rn.finished)
+}
+
+// FinalVerdict returns the immutable authentication result after FinishAuth.
+// It allows a late or retried Followup request to observe the same result even
+// after another request consumed the buffered channel value.
+func (rn *AuthRequest) FinalVerdict() (AuthVerdict, bool) {
+	rn.finalMu.RLock()
+	defer rn.finalMu.RUnlock()
+	if rn.finalVerdict == nil {
+		return AuthVerdict{}, false
+	}
+
+	return *rn.finalVerdict, true
 }
 
 func (rn *AuthRequest) WaitForAuth() <-chan AuthVerdict {

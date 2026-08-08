@@ -139,7 +139,7 @@ var destroyUserCmd = &cobra.Command{
 		user := users.GetUsers()[0]
 
 		if !confirmAction(cmd, fmt.Sprintf(
-			"Do you want to remove the user %q (%d) and any associated preauthkeys?",
+			"Do you want to remove the network user %q (%d) and all associated nodes?",
 			user.GetName(), user.GetId(),
 		)) {
 			return printOutput(cmd, map[string]string{"Result": "User not destroyed"}, "User not destroyed")

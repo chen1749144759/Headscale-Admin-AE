@@ -1,129 +1,54 @@
-# API
+# 私有管理接口
 
-Headscale provides a [HTTP REST API](#rest-api) and a [gRPC interface](#grpc) which may be used to integrate a [web
-interface](integration/web-ui.md), [remote control Headscale](#setup-remote-control) or provide a base for custom
-integration and tooling.
+Headscale-Admin-AE 不提供可从公网访问的 REST 管理 API 或远程 gRPC 管理端口。
+公网 HTTP 监听器只承载 ScaleTail 控制协议、健康检查、版本、客户端更新检查和启用后的
+内置 DERP。
 
-Both interfaces require a valid API key before use. To create an API key, log into your Headscale server and generate
-one with the default expiration of 90 days:
+## 接口边界
 
-```shell
-headscale apikeys create
+| 接口 | 传输 | 调用方 | 是否可公开 |
+|---|---|---|---|
+| `unix_socket` | Unix gRPC | 同主机受信任管理员 | 否 |
+| `scaleforge.socket` | Unix HTTP | ScaleForge 后端 | 否 |
+| `scaleforge.backend_socket` | Unix HTTP | Headscale 转发已认证节点请求到 ScaleForge | 否 |
+| 主 HTTP 监听器 | HTTPS/Noise | ScaleTail 节点 | 仅公开控制协议 |
+
+`scaleforge.socket` 由 Headscale 提供，并通过私有 gRPC gateway 调用本机
+`unix_socket`。认证边界是 Unix socket 文件权限、容器用户组和挂载范围，不是共享
+API Key。ScaleForge 浏览器会话使用单独的账户 session，不能直接访问该 socket。
+
+## API Key 已禁用
+
+- `headscale apikeys` CLI 命令已移除。
+- `CreateApiKey`、`ExpireApiKey`、`ListApiKeys`、`DeleteApiKey` 均返回 gRPC
+  `FailedPrecondition`。
+- `/api/v1`、Swagger 和远程 gRPC 不挂载到公网路由。
+- `HEADSCALE_CLI_API_KEY` 不属于支持的部署配置。
+
+数据库模型、历史表和 protobuf 消息仍然存在，仅用于旧数据库迁移和保持已发布 schema
+顺序稳定。保留这些结构不代表 API Key 功能可用。
+
+## 本机管理
+
+需要运行维护命令时，在 Headscale 主机或容器内通过 `unix_socket` 执行：
+
+```bash
+headscale users list
+headscale nodes list
 ```
 
-Copy the output of the command and save it for later. Please note that you can not retrieve an API key again. If the API
-key is lost, expire the old one, and create a new one.
+不要扩大 socket 权限到 `0777`，不要把 socket 放入所有容器共享的目录，也不要用
+TCP 转发、socat 或反向代理把它暴露出去。
 
-To list the API keys currently associated with the server:
+## ScaleForge 接入
 
-```shell
-headscale apikeys list
-```
+组合部署应满足：
 
-and to expire an API key:
+1. Headscale 与 ScaleForge 后端共享 `scaleforge.socket` 所在目录。
+2. 只有两个服务的运行用户/组对 socket 具有读写权限。
+3. 前端和公网代理都不能挂载或访问该目录。
+4. `scaleforge.backend_socket` 使用独立路径，不能与另外两个 socket 重合。
+5. Bootstrap 密码通过 secret 文件提供，不作为接口凭据复用。
 
-```shell
-headscale apikeys expire --prefix <PREFIX>
-```
-
-## REST API
-
-- API endpoint: `/api/v1`, e.g. `https://headscale.example.com/api/v1`
-- Documentation: `/swagger`, e.g. `https://headscale.example.com/swagger`
-- Headscale Version: `/version`, e.g. `https://headscale.example.com/version`
-- Authenticate using HTTP Bearer authentication by sending the [API key](#api) with the HTTP `Authorization: Bearer <API_KEY>` header.
-
-Start by [creating an API key](#api) and test it with the examples below. Read the API documentation provided by your
-Headscale server at `/swagger` for details.
-
-=== "Get details for all users"
-
-    ```console
-    curl -H "Authorization: Bearer <API_KEY>" \
-        https://headscale.example.com/api/v1/user
-    ```
-
-=== "Get details for user 'bob'"
-
-    ```console
-    curl -H "Authorization: Bearer <API_KEY>" \
-        https://headscale.example.com/api/v1/user?name=bob
-    ```
-
-=== "Register a node"
-
-    ```console
-    curl -H "Authorization: Bearer <API_KEY>" \
-        --json '{"user": "<USER>", "authId": "AUTH_ID>"}' \
-        https://headscale.example.com/api/v1/auth/register
-    ```
-
-## gRPC
-
-The gRPC interface can be used to control a Headscale instance from a remote machine with the `headscale` binary.
-
-### Prerequisite
-
-- A workstation to run `headscale` (any supported platform, e.g. Linux).
-- A Headscale server with gRPC enabled.
-- Connections to the gRPC port (default: `50443`) are allowed.
-- Remote access requires an encrypted connection via TLS.
-- An [API key](#api) to authenticate with the Headscale server.
-
-### Setup remote control
-
-1. Download the [`headscale` binary from GitHub's release page](https://github.com/juanfont/headscale/releases). Make
-   sure to use the same version as on the server.
-
-1. Put the binary somewhere in your `PATH`, e.g. `/usr/local/bin/headscale`
-
-1. Make `headscale` executable: `chmod +x /usr/local/bin/headscale`
-
-1. [Create an API key](#api) on the Headscale server.
-
-1. Provide the connection parameters for the remote Headscale server either via a minimal YAML configuration file or
-   via environment variables:
-
-    === "Minimal YAML configuration file"
-
-        ```yaml title="config.yaml"
-        cli:
-            address: <HEADSCALE_ADDRESS>:<PORT>
-            api_key: <API_KEY>
-        ```
-
-    === "Environment variables"
-
-        ```shell
-        export HEADSCALE_CLI_ADDRESS="<HEADSCALE_ADDRESS>:<PORT>"
-        export HEADSCALE_CLI_API_KEY="<API_KEY>"
-        ```
-
-    This instructs the `headscale` binary to connect to a remote instance at `<HEADSCALE_ADDRESS>:<PORT>`, instead of
-    connecting to the local instance.
-
-1. Test the connection by listing all nodes:
-
-    ```shell
-    headscale nodes list
-    ```
-
-    You should now be able to see a list of your nodes from your workstation, and you can
-    now control the Headscale server from your workstation.
-
-### Behind a proxy
-
-It's possible to run the gRPC remote endpoint behind a reverse proxy, like Nginx, and have it run on the _same_ port as Headscale.
-
-While this is _not a supported_ feature, an example on how this can be set up on
-[NixOS is shown here](https://github.com/kradalby/dotfiles/blob/4489cdbb19cddfbfae82cd70448a38fde5a76711/machines/headscale.oracldn/headscale.nix#L61-L91).
-
-### Troubleshooting
-
-- Make sure you have the _same_ Headscale version on your server and workstation.
-- Ensure that connections to the gRPC port are allowed.
-- Verify that your TLS certificate is valid and trusted.
-- If you don't have access to a trusted certificate (e.g. from Let's Encrypt), either:
-    - Add your self-signed certificate to the trust store of your OS _or_
-    - Disable certificate verification by either setting `cli.insecure: true` in the configuration file or by setting
-      `HEADSCALE_CLI_INSECURE=1` via an environment variable. We do **not** recommend to disable certificate validation.
+任何需要新增的管理能力都应在私有 ScaleForge 接口中显式实现和授权，不应恢复 API
+Key 或公网管理 API。

@@ -21,8 +21,6 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"gorm.io/gorm"
 	"tailscale.com/net/tsaddr"
-	"tailscale.com/tailcfg"
-	"tailscale.com/types/key"
 	"tailscale.com/types/views"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
@@ -147,155 +145,35 @@ func (api headscaleV1APIServer) CreatePreAuthKey(
 	ctx context.Context,
 	request *v1.CreatePreAuthKeyRequest,
 ) (*v1.CreatePreAuthKeyResponse, error) {
-	var expiration time.Time
-	if request.GetExpiration() != nil {
-		expiration = request.GetExpiration().AsTime()
-	}
-
-	for _, tag := range request.AclTags {
-		err := validateTag(tag)
-		if err != nil {
-			return &v1.CreatePreAuthKeyResponse{
-				PreAuthKey: nil,
-			}, status.Error(codes.InvalidArgument, err.Error())
-		}
-	}
-
-	var userID *types.UserID
-	if request.GetUser() != 0 {
-		user, err := api.h.state.GetUserByID(types.UserID(request.GetUser()))
-		if err != nil {
-			return nil, err
-		}
-		userID = user.TypedID()
-	}
-
-	preAuthKey, err := api.h.state.CreatePreAuthKey(
-		userID,
-		request.GetReusable(),
-		request.GetEphemeral(),
-		&expiration,
-		request.AclTags,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	return &v1.CreatePreAuthKeyResponse{PreAuthKey: preAuthKey.Proto()}, nil
+	return nil, status.Error(codes.FailedPrecondition, "pre-authentication keys are disabled; use account login")
 }
 
 func (api headscaleV1APIServer) ExpirePreAuthKey(
 	ctx context.Context,
 	request *v1.ExpirePreAuthKeyRequest,
 ) (*v1.ExpirePreAuthKeyResponse, error) {
-	err := api.h.state.ExpirePreAuthKey(request.GetId())
-	if err != nil {
-		return nil, err
-	}
-
-	return &v1.ExpirePreAuthKeyResponse{}, nil
+	return nil, status.Error(codes.FailedPrecondition, "pre-authentication keys are disabled; use account login")
 }
 
 func (api headscaleV1APIServer) DeletePreAuthKey(
 	ctx context.Context,
 	request *v1.DeletePreAuthKeyRequest,
 ) (*v1.DeletePreAuthKeyResponse, error) {
-	err := api.h.state.DeletePreAuthKey(request.GetId())
-	if err != nil {
-		return nil, err
-	}
-
-	return &v1.DeletePreAuthKeyResponse{}, nil
+	return nil, status.Error(codes.FailedPrecondition, "pre-authentication keys are disabled; use account login")
 }
 
 func (api headscaleV1APIServer) ListPreAuthKeys(
 	ctx context.Context,
 	request *v1.ListPreAuthKeysRequest,
 ) (*v1.ListPreAuthKeysResponse, error) {
-	preAuthKeys, err := api.h.state.ListPreAuthKeys()
-	if err != nil {
-		return nil, err
-	}
-
-	response := make([]*v1.PreAuthKey, len(preAuthKeys))
-	for index, key := range preAuthKeys {
-		response[index] = key.Proto()
-	}
-
-	sort.Slice(response, func(i, j int) bool {
-		return response[i].Id < response[j].Id
-	})
-
-	return &v1.ListPreAuthKeysResponse{PreAuthKeys: response}, nil
+	return nil, status.Error(codes.FailedPrecondition, "pre-authentication keys are disabled; use account login")
 }
 
 func (api headscaleV1APIServer) RegisterNode(
 	ctx context.Context,
 	request *v1.RegisterNodeRequest,
 ) (*v1.RegisterNodeResponse, error) {
-	// Generate ephemeral registration key for tracking this registration flow in logs
-	registrationKey, err := util.GenerateRegistrationKey()
-	if err != nil {
-		log.Warn().Err(err).Msg("failed to generate registration key")
-		registrationKey = "" // Continue without key if generation fails
-	}
-
-	log.Trace().
-		Caller().
-		Str(zf.UserName, request.GetUser()).
-		Str(zf.RegistrationID, request.GetKey()).
-		Str(zf.RegistrationKey, registrationKey).
-		Msg("registering node")
-
-	registrationId, err := types.AuthIDFromString(request.GetKey())
-	if err != nil {
-		return nil, err
-	}
-
-	user, err := api.h.state.GetUserByName(request.GetUser())
-	if err != nil {
-		return nil, fmt.Errorf("looking up user: %w", err)
-	}
-
-	node, nodeChange, err := api.h.state.HandleNodeFromAuthPath(
-		registrationId,
-		types.UserID(user.ID),
-		nil,
-		util.RegisterMethodCLI,
-	)
-	if err != nil {
-		log.Error().
-			Str(zf.RegistrationKey, registrationKey).
-			Err(err).
-			Msg("failed to register node")
-		return nil, err
-	}
-
-	log.Info().
-		Str(zf.RegistrationKey, registrationKey).
-		EmbedObject(node).
-		Msg("node registered successfully")
-
-	// This is a bit of a back and forth, but we have a bit of a chicken and egg
-	// dependency here.
-	// Because the way the policy manager works, we need to have the node
-	// in the database, then add it to the policy manager and then we can
-	// approve the route. This means we get this dance where the node is
-	// first added to the database, then we add it to the policy manager via
-	// SaveNode (which automatically updates the policy manager) and then we can auto approve the routes.
-	// As that only approves the struct object, we need to save it again and
-	// ensure we send an update.
-	// This works, but might be another good candidate for doing some sort of
-	// eventbus.
-	routeChange, err := api.h.state.AutoApproveRoutes(node)
-	if err != nil {
-		return nil, fmt.Errorf("auto approving routes: %w", err)
-	}
-
-	// Send both changes. Empty changes are ignored by Change().
-	api.h.Change(nodeChange, routeChange)
-
-	return &v1.RegisterNodeResponse{Node: node.Proto()}, nil
+	return nil, status.Error(codes.FailedPrecondition, "manual node registration is disabled; use ScaleTail account login")
 }
 
 func (api headscaleV1APIServer) GetNode(
@@ -316,50 +194,7 @@ func (api headscaleV1APIServer) SetTags(
 	ctx context.Context,
 	request *v1.SetTagsRequest,
 ) (*v1.SetTagsResponse, error) {
-	// Validate tags not empty - tagged nodes must have at least one tag
-	if len(request.GetTags()) == 0 {
-		return &v1.SetTagsResponse{
-				Node: nil,
-			}, status.Error(
-				codes.InvalidArgument,
-				"cannot remove all tags from a node - tagged nodes must have at least one tag",
-			)
-	}
-
-	// Validate tag format
-	for _, tag := range request.GetTags() {
-		err := validateTag(tag)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// User XOR Tags: nodes are either tagged or user-owned, never both.
-	// Setting tags on a user-owned node converts it to a tagged node.
-	// Once tagged, a node cannot be converted back to user-owned.
-	_, found := api.h.state.GetNodeByID(types.NodeID(request.GetNodeId()))
-	if !found {
-		return &v1.SetTagsResponse{
-			Node: nil,
-		}, status.Error(codes.NotFound, "node not found")
-	}
-
-	node, nodeChange, err := api.h.state.SetNodeTags(types.NodeID(request.GetNodeId()), request.GetTags())
-	if err != nil {
-		return &v1.SetTagsResponse{
-			Node: nil,
-		}, status.Error(codes.InvalidArgument, err.Error())
-	}
-
-	api.h.Change(nodeChange)
-
-	log.Trace().
-		Caller().
-		EmbedObject(node).
-		Strs("tags", request.GetTags()).
-		Msg("changing tags of node")
-
-	return &v1.SetTagsResponse{Node: node.Proto()}, nil
+	return nil, status.Error(codes.FailedPrecondition, "identity tags are disabled for account-authenticated ScaleTail nodes")
 }
 
 func (api headscaleV1APIServer) SetApprovedRoutes(
@@ -612,95 +447,40 @@ func (api headscaleV1APIServer) CreateApiKey(
 	ctx context.Context,
 	request *v1.CreateApiKeyRequest,
 ) (*v1.CreateApiKeyResponse, error) {
-	var expiration time.Time
-	if request.GetExpiration() != nil {
-		expiration = request.GetExpiration().AsTime()
-	}
-
-	apiKey, _, err := api.h.state.CreateAPIKey(&expiration)
-	if err != nil {
-		return nil, err
-	}
-
-	return &v1.CreateApiKeyResponse{ApiKey: apiKey}, nil
-}
-
-// apiKeyIdentifier is implemented by requests that identify an API key.
-type apiKeyIdentifier interface {
-	GetId() uint64
-	GetPrefix() string
-}
-
-// getAPIKey retrieves an API key by ID or prefix from the request.
-// Returns InvalidArgument if neither or both are provided.
-func (api headscaleV1APIServer) getAPIKey(req apiKeyIdentifier) (*types.APIKey, error) {
-	hasID := req.GetId() != 0
-	hasPrefix := req.GetPrefix() != ""
-
-	switch {
-	case hasID && hasPrefix:
-		return nil, status.Error(codes.InvalidArgument, "provide either id or prefix, not both")
-	case hasID:
-		return api.h.state.GetAPIKeyByID(req.GetId())
-	case hasPrefix:
-		return api.h.state.GetAPIKey(req.GetPrefix())
-	default:
-		return nil, status.Error(codes.InvalidArgument, "must provide id or prefix")
-	}
+	return nil, status.Error(
+		codes.FailedPrecondition,
+		"API key management is disabled; use the private ScaleForge account administration interface",
+	)
 }
 
 func (api headscaleV1APIServer) ExpireApiKey(
 	ctx context.Context,
 	request *v1.ExpireApiKeyRequest,
 ) (*v1.ExpireApiKeyResponse, error) {
-	apiKey, err := api.getAPIKey(request)
-	if err != nil {
-		return nil, err
-	}
-
-	err = api.h.state.ExpireAPIKey(apiKey)
-	if err != nil {
-		return nil, err
-	}
-
-	return &v1.ExpireApiKeyResponse{}, nil
+	return nil, status.Error(
+		codes.FailedPrecondition,
+		"API key management is disabled; use the private ScaleForge account administration interface",
+	)
 }
 
 func (api headscaleV1APIServer) ListApiKeys(
 	ctx context.Context,
 	request *v1.ListApiKeysRequest,
 ) (*v1.ListApiKeysResponse, error) {
-	apiKeys, err := api.h.state.ListAPIKeys()
-	if err != nil {
-		return nil, err
-	}
-
-	response := make([]*v1.ApiKey, len(apiKeys))
-	for index, key := range apiKeys {
-		response[index] = key.Proto()
-	}
-
-	sort.Slice(response, func(i, j int) bool {
-		return response[i].Id < response[j].Id
-	})
-
-	return &v1.ListApiKeysResponse{ApiKeys: response}, nil
+	return nil, status.Error(
+		codes.FailedPrecondition,
+		"API key management is disabled; use the private ScaleForge account administration interface",
+	)
 }
 
 func (api headscaleV1APIServer) DeleteApiKey(
 	ctx context.Context,
 	request *v1.DeleteApiKeyRequest,
 ) (*v1.DeleteApiKeyResponse, error) {
-	apiKey, err := api.getAPIKey(request)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := api.h.state.DestroyAPIKey(*apiKey); err != nil {
-		return nil, err
-	}
-
-	return &v1.DeleteApiKeyResponse{}, nil
+	return nil, status.Error(
+		codes.FailedPrecondition,
+		"API key management is disabled; use the private ScaleForge account administration interface",
+	)
 }
 
 func (api headscaleV1APIServer) GetPolicy(
@@ -801,65 +581,11 @@ func (api headscaleV1APIServer) SetPolicy(
 	return response, nil
 }
 
-// The following service calls are for testing and debugging
 func (api headscaleV1APIServer) DebugCreateNode(
 	ctx context.Context,
 	request *v1.DebugCreateNodeRequest,
 ) (*v1.DebugCreateNodeResponse, error) {
-	user, err := api.h.state.GetUserByName(request.GetUser())
-	if err != nil {
-		return nil, err
-	}
-
-	routes, err := util.StringToIPPrefix(request.GetRoutes())
-	if err != nil {
-		return nil, err
-	}
-
-	log.Trace().
-		Caller().
-		Interface("route-prefix", routes).
-		Interface("route-str", request.GetRoutes()).
-		Msg("Creating routes for node")
-
-	registrationId, err := types.AuthIDFromString(request.GetKey())
-	if err != nil {
-		return nil, err
-	}
-
-	regData := &types.RegistrationData{
-		NodeKey:    key.NewNode().Public(),
-		MachineKey: key.NewMachine().Public(),
-		Hostname:   request.GetName(),
-		Expiry:     &time.Time{}, // zero time, not nil — preserves proto JSON round-trip semantics
-	}
-
-	log.Debug().
-		Caller().
-		Str("registration_id", registrationId.String()).
-		Msg("adding debug machine via CLI, appending to registration cache")
-
-	authRegReq := types.NewRegisterAuthRequest(regData)
-	api.h.state.SetAuthCacheEntry(registrationId, authRegReq)
-
-	// Echo back a synthetic Node so the debug response surface stays
-	// stable. The actual node is created later by AuthApprove via
-	// HandleNodeFromAuthPath using the cached RegistrationData.
-	echoNode := types.Node{
-		NodeKey:    regData.NodeKey,
-		MachineKey: regData.MachineKey,
-		Hostname:   regData.Hostname,
-		User:       user,
-		Expiry:     &time.Time{},
-		LastSeen:   &time.Time{},
-		Hostinfo: &tailcfg.Hostinfo{
-			Hostname:    request.GetName(),
-			OS:          "TestOS",
-			RoutableIPs: routes,
-		},
-	}
-
-	return &v1.DebugCreateNodeResponse{Node: echoNode.Proto()}, nil
+	return nil, status.Error(codes.FailedPrecondition, "debug node creation is disabled; use ScaleTail account login")
 }
 
 func (api headscaleV1APIServer) Health(
@@ -886,55 +612,21 @@ func (api headscaleV1APIServer) AuthRegister(
 	ctx context.Context,
 	request *v1.AuthRegisterRequest,
 ) (*v1.AuthRegisterResponse, error) {
-	resp, err := api.RegisterNode(ctx, &v1.RegisterNodeRequest{
-		Key:  request.GetAuthId(),
-		User: request.GetUser(),
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return &v1.AuthRegisterResponse{Node: resp.GetNode()}, nil
+	return nil, status.Error(codes.FailedPrecondition, "manual node authentication is disabled; use ScaleTail account login")
 }
 
 func (api headscaleV1APIServer) AuthApprove(
 	ctx context.Context,
 	request *v1.AuthApproveRequest,
 ) (*v1.AuthApproveResponse, error) {
-	authID, err := types.AuthIDFromString(request.GetAuthId())
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid auth_id: %v", err)
-	}
-
-	authReq, ok := api.h.state.GetAuthCacheEntry(authID)
-	if !ok {
-		return nil, status.Errorf(codes.NotFound, "no pending auth session for auth_id %s", authID)
-	}
-
-	authReq.FinishAuth(types.AuthVerdict{})
-
-	return &v1.AuthApproveResponse{}, nil
+	return nil, status.Error(codes.FailedPrecondition, "manual node authentication is disabled; use ScaleTail account login")
 }
 
 func (api headscaleV1APIServer) AuthReject(
 	ctx context.Context,
 	request *v1.AuthRejectRequest,
 ) (*v1.AuthRejectResponse, error) {
-	authID, err := types.AuthIDFromString(request.GetAuthId())
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid auth_id: %v", err)
-	}
-
-	authReq, ok := api.h.state.GetAuthCacheEntry(authID)
-	if !ok {
-		return nil, status.Errorf(codes.NotFound, "no pending auth session for auth_id %s", authID)
-	}
-
-	authReq.FinishAuth(types.AuthVerdict{
-		Err: fmt.Errorf("auth request rejected"),
-	})
-
-	return &v1.AuthRejectResponse{}, nil
+	return nil, status.Error(codes.FailedPrecondition, "manual node authentication is disabled; use ScaleTail account login")
 }
 
 func (api headscaleV1APIServer) mustEmbedUnimplementedHeadscaleServiceServer() {}

@@ -37,6 +37,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
@@ -48,10 +49,9 @@ const (
 
 	// defaultRegisterCacheMaxEntries is the default upper bound on the number
 	// of pending registration entries the auth cache will hold. With a 15-minute
-	// TTL and a stripped-down RegistrationData payload (~200 bytes per entry),
-	// 1024 entries cap the worst-case cache footprint at well under 1 MiB even
-	// under sustained unauthenticated cache-fill attempts.
-	defaultRegisterCacheMaxEntries = 1024
+	// TTL and a bounded RegistrationData payload, 256 entries keep the cache
+	// within a few MiB under sustained unauthenticated cache-fill attempts.
+	defaultRegisterCacheMaxEntries = 256
 
 	// defaultNodeStoreBatchSize is the default number of write operations to batch
 	// before rebuilding the in-memory node snapshot.
@@ -121,12 +121,11 @@ var ErrNodeKeyInUse = errors.New("node key already in use by another machine")
 // multiple ownership candidates and the correct node cannot be chosen safely.
 var ErrAmbiguousNodeOwnership = errors.New("machine key maps to ambiguous node ownership")
 
-// sshCheckPair identifies a (source, destination) node pair for
-// SSH check auth tracking.
-type sshCheckPair struct {
-	Src types.NodeID
-	Dst types.NodeID
-}
+var (
+	ErrAuthRequestNotRegistration = errors.New("auth request is not a node registration")
+	ErrAuthRequestAlreadyClaimed  = errors.New("auth request has already been consumed")
+	ErrAccountNodeLimitReached    = errors.New("account node limit reached")
+)
 
 // State manages Headscale's core state, coordinating between database, policy management,
 // IP allocation, and DERP routing. All methods are thread-safe.
@@ -144,11 +143,16 @@ type State struct {
 	ipAlloc *hsdb.IPAllocator
 	// derpMap contains the current DERP relay configuration
 	derpMap atomic.Pointer[tailcfg.DERPMap]
+	// dnsConfig is atomically swapped so active mappers immediately observe
+	// DNS changes without racing against configuration writes.
+	dnsConfig   atomic.Pointer[tailcfg.DNSConfig]
+	dnsConfigMu sync.RWMutex
+	runtimeDNS  types.RuntimeDNSConfig
 	// polMan handles policy evaluation and management
 	polMan policy.PolicyManager
 
-	// authCache holds any pending authentication requests from either auth
-	// type (Web and OIDC). It is a bounded LRU keyed by AuthID; oldest
+	// authCache holds pending account-password node registrations. It is a
+	// bounded LRU keyed by AuthID; oldest
 	// entries are evicted once the size cap is reached, and entries that
 	// time out have their auth verdict resolved with ErrRegistrationExpired
 	// via the eviction callback so any waiting goroutines wake.
@@ -166,40 +170,58 @@ type State struct {
 	// pings tracks pending ping requests and their response channels.
 	pings *pingTracker
 
-	// sshCheckAuth tracks when source nodes last completed SSH check auth.
-	//
-	// For rules without explicit checkPeriod (default 12h), auth covers any
-	// destination — keyed by (src, Dst=0) where 0 is a sentinel meaning "any".
-	// Ref: "Once re-authenticated to a destination, the user can access the
-	// device and any other device in the tailnet without re-verification
-	// for the next 12 hours." — https://tailscale.com/docs/features/tailscale-ssh
-	//
-	// For rules with explicit checkPeriod, auth covers only that specific
-	// destination — keyed by (src, dst).
-	// Ref: "If a different check period is specified for the connection,
-	// then the user can access specifically this device without
-	// re-verification for the duration of the check period."
-	//
-	// Ref: https://github.com/tailscale/tailscale/issues/10480
-	// Ref: https://github.com/tailscale/tailscale/issues/7125
-	sshCheckAuth map[sshCheckPair]time.Time
-	sshCheckMu   sync.RWMutex
-
 	// registerLocks serializes registration per machine key so concurrent
 	// joins/re-auths for the same machine cannot race into duplicate nodes.
-	registerLocks sync.Map // key.MachinePublic -> *sync.Mutex
+	registerLocks keyedMutex[key.MachinePublic]
+	// registerUserLocks serializes new password registrations per account-owned
+	// network so concurrent machines cannot race past the node cap.
+	registerUserLocks keyedMutex[types.UserID]
+	// accountOperationLocks serializes credential-backed node operations with
+	// password changes, account disablement and account reassignment.
+	accountOperationLocks keyedMutex[uint]
+}
+
+type keyedMutexEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+type keyedMutex[K comparable] struct {
+	mu      sync.Mutex
+	entries map[K]*keyedMutexEntry
+}
+
+func (locks *keyedMutex[K]) lock(key K) func() {
+	locks.mu.Lock()
+	if locks.entries == nil {
+		locks.entries = make(map[K]*keyedMutexEntry)
+	}
+	entry := locks.entries[key]
+	if entry == nil {
+		entry = &keyedMutexEntry{}
+		locks.entries[key] = entry
+	}
+	entry.refs++
+	locks.mu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		locks.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(locks.entries, key)
+		}
+		locks.mu.Unlock()
+	}
 }
 
 func (s *State) lockRegistration(machineKey key.MachinePublic) func() {
-	val, _ := s.registerLocks.LoadOrStore(machineKey, &sync.Mutex{})
-	mu, ok := val.(*sync.Mutex)
-	if !ok {
-		return func() {}
-	}
+	return s.registerLocks.lock(machineKey)
+}
 
-	mu.Lock()
-
-	return mu.Unlock
+func (s *State) lockUserRegistration(userID types.UserID) func() {
+	return s.registerUserLocks.lock(userID)
 }
 
 // NewState creates and initializes a new State instance, setting up the database,
@@ -227,6 +249,16 @@ func NewState(cfg *types.Config) (*State, error) {
 	if err != nil {
 		return nil, fmt.Errorf("initializing database: %w", err)
 	}
+	runtimeDNS := types.RuntimeDNSConfigFrom(cfg.DNSConfig)
+	storedDNS, found, err := db.LoadRuntimeDNSConfig()
+	if err != nil {
+		return nil, fmt.Errorf("loading runtime DNS configuration: %w", err)
+	}
+	if found {
+		runtimeDNS = storedDNS
+	}
+	cfg.DNSConfig = runtimeDNS.ApplyTo(cfg.DNSConfig)
+	cfg.TailcfgDNSConfig = buildTailcfgDNSConfig(cfg)
 
 	ipAlloc, err := hsdb.NewIPAllocator(db, cfg.PrefixV4, cfg.PrefixV6, cfg.IPAllocation)
 	if err != nil {
@@ -294,7 +326,12 @@ func NewState(cfg *types.Config) (*State, error) {
 		nodeStore:     nodeStore,
 		pings:         newPingTracker(),
 
-		sshCheckAuth: make(map[sshCheckPair]time.Time),
+		runtimeDNS: runtimeDNS,
+	}
+	s.dnsConfig.Store(cfg.TailcfgDNSConfig.Clone())
+	if err := s.reconcileAccountNodeExpiries(time.Now().UTC()); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("reconciling account node lifetimes: %w", err)
 	}
 
 	// Report legacy rows that cannot be represented in a network map. The
@@ -327,6 +364,86 @@ func (s *State) DERPMap() tailcfg.DERPMapView {
 	return s.derpMap.Load().View()
 }
 
+func buildTailcfgDNSConfig(cfg *types.Config) *tailcfg.DNSConfig {
+	dnsConfig := cfg.DNSConfig.Tailcfg()
+	if dnsConfig == nil || !dnsConfig.Proxied {
+		return dnsConfig
+	}
+
+	var magicDNSDomains []dnsname.FQDN
+	if cfg.PrefixV4 != nil {
+		magicDNSDomains = append(magicDNSDomains, util.GenerateIPv4DNSRootDomain(*cfg.PrefixV4)...)
+	}
+	if cfg.PrefixV6 != nil {
+		magicDNSDomains = append(magicDNSDomains, util.GenerateIPv6DNSRootDomain(*cfg.PrefixV6)...)
+	}
+	if dnsConfig.Routes == nil {
+		dnsConfig.Routes = make(map[string][]*dnstype.Resolver)
+	}
+	for _, domain := range magicDNSDomains {
+		dnsConfig.Routes[domain.WithoutTrailingDot()] = nil
+	}
+
+	return dnsConfig
+}
+
+// DNSConfig returns an isolated copy of the currently effective client DNS policy.
+func (s *State) DNSConfig() *tailcfg.DNSConfig {
+	config := s.dnsConfig.Load()
+	if config == nil {
+		return nil
+	}
+
+	return config.Clone()
+}
+
+func (s *State) RuntimeDNSConfig() types.RuntimeDNSConfig {
+	s.dnsConfigMu.RLock()
+	defer s.dnsConfigMu.RUnlock()
+
+	config := s.runtimeDNS
+	config.GlobalNameservers = append([]string(nil), config.GlobalNameservers...)
+	config.SearchDomains = append([]string(nil), config.SearchDomains...)
+
+	return config
+}
+
+func (s *State) SetRuntimeDNSConfig(config types.RuntimeDNSConfig) error {
+	s.dnsConfigMu.Lock()
+	defer s.dnsConfigMu.Unlock()
+
+	if err := s.db.SaveRuntimeDNSConfig(config); err != nil {
+		return err
+	}
+
+	nextConfig := *s.cfg
+	nextConfig.DNSConfig = config.ApplyTo(s.cfg.DNSConfig)
+	nextDNS := buildTailcfgDNSConfig(&nextConfig)
+	if current := s.dnsConfig.Load(); current != nil {
+		nextDNS.ExtraRecords = append([]tailcfg.DNSRecord(nil), current.ExtraRecords...)
+	}
+
+	s.runtimeDNS = config
+	s.runtimeDNS.GlobalNameservers = append([]string(nil), config.GlobalNameservers...)
+	s.runtimeDNS.SearchDomains = append([]string(nil), config.SearchDomains...)
+	s.dnsConfig.Store(nextDNS)
+
+	return nil
+}
+
+func (s *State) SetExtraDNSRecords(records []tailcfg.DNSRecord) {
+	s.dnsConfigMu.Lock()
+	defer s.dnsConfigMu.Unlock()
+
+	current := s.dnsConfig.Load()
+	if current == nil {
+		return
+	}
+	next := current.Clone()
+	next.ExtraRecords = append([]tailcfg.DNSRecord(nil), records...)
+	s.dnsConfig.Store(next)
+}
+
 // ReloadPolicy reloads the access control policy and triggers auto-approval if changed.
 // Returns true if the policy changed.
 func (s *State) ReloadPolicy() ([]change.Change, error) {
@@ -339,10 +456,6 @@ func (s *State) ReloadPolicy() ([]change.Change, error) {
 	if err != nil {
 		return nil, fmt.Errorf("setting policy: %w", err)
 	}
-
-	// Clear SSH check auth times when policy changes to ensure stale
-	// approvals don't persist if checkPeriod rules are modified or removed.
-	s.ClearSSHCheckAuth()
 
 	// Rebuild peer maps after policy changes because the peersFunc in NodeStore
 	// uses the PolicyManager's filters. Without this, nodes won't see newly allowed
@@ -490,6 +603,254 @@ func (s *State) GetUserByName(name string) (*types.User, error) {
 // GetUserByOIDCIdentifier retrieves a user by their OIDC identifier.
 func (s *State) GetUserByOIDCIdentifier(id string) (*types.User, error) {
 	return s.db.GetUserByOIDCIdentifier(id)
+}
+
+// AuthenticateAccount verifies the single ScaleTail/ScaleForge human
+// credential stored by Headscale.
+func (s *State) AuthenticateAccount(
+	username,
+	password string,
+	now time.Time,
+) (*types.Account, error) {
+	return s.db.AuthenticateAccount(username, password, now)
+}
+
+func (s *State) CreateAccount(params hsdb.CreateAccountParams) (*types.Account, error) {
+	return s.db.CreateAccount(params)
+}
+
+func (s *State) CountAccounts() (int64, error) {
+	return s.db.CountAccounts()
+}
+
+func (s *State) ValidateManagerAccountInvariant() error {
+	return s.db.ValidateManagerAccountInvariant()
+}
+
+func (s *State) ListAccounts() ([]types.Account, error) {
+	return s.db.ListAccounts()
+}
+
+func (s *State) GetAccountByID(accountID uint) (*types.Account, error) {
+	return s.db.GetAccountByID(accountID)
+}
+
+func (s *State) UpdateAccount(
+	accountID uint,
+	params hsdb.UpdateAccountParams,
+	now time.Time,
+) (*types.Account, []change.Change, error) {
+	unlock := s.accountOperationLocks.lock(accountID)
+	defer unlock()
+
+	current, err := s.db.GetAccountByID(accountID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	updated, err := s.db.UpdateAccount(accountID, params, now)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	changes := make([]change.Change, 0)
+	if current.UserID != nil &&
+		(updated.UserID == nil || *current.UserID != *updated.UserID) {
+		oldChanges, reconcileErr := s.reconcileAccountNodes(
+			current.UserID,
+			now,
+			now,
+		)
+		changes = append(changes, oldChanges...)
+		if reconcileErr != nil {
+			return updated, changes, reconcileErr
+		}
+	}
+	if updated.UserID != nil {
+		nodeChanges, reconcileErr := s.reconcileAccountNodes(
+			updated.UserID,
+			accountNodeExpiry(updated, now),
+			now,
+		)
+		changes = append(changes, nodeChanges...)
+		if reconcileErr != nil {
+			return updated, changes, reconcileErr
+		}
+	}
+
+	return updated, changes, nil
+}
+
+func (s *State) BootstrapManagerAccount(username, password string) (*types.Account, error) {
+	return s.db.BootstrapManagerAccount(username, password)
+}
+
+func (s *State) CreateAccountSession(
+	account *types.Account,
+	restricted bool,
+	now time.Time,
+) (string, *types.AccountSession, error) {
+	return s.db.CreateAccountSession(account, restricted, now)
+}
+
+func (s *State) ValidateAccountSession(
+	token string,
+	now time.Time,
+) (*types.AccountSession, error) {
+	return s.db.ValidateAccountSession(token, now)
+}
+
+func (s *State) RevokeAccountSession(token string, now time.Time) error {
+	return s.db.RevokeAccountSession(token, now)
+}
+
+func (s *State) ChangeAccountPassword(
+	accountID uint,
+	newPassword string,
+	now time.Time,
+) ([]change.Change, error) {
+	return s.changeAccountPassword(accountID, func() error {
+		return s.db.ChangeAccountPassword(accountID, newPassword, now)
+	}, now)
+}
+
+func (s *State) ResetAccountPassword(
+	accountID uint,
+	newPassword string,
+	now time.Time,
+	actorAccountID uint,
+) ([]change.Change, error) {
+	return s.changeAccountPassword(accountID, func() error {
+		return s.db.ResetAccountPassword(accountID, newPassword, now, actorAccountID)
+	}, now)
+}
+
+func (s *State) changeAccountPassword(
+	accountID uint,
+	changePassword func() error,
+	now time.Time,
+) ([]change.Change, error) {
+	unlock := s.accountOperationLocks.lock(accountID)
+	defer unlock()
+
+	if err := changePassword(); err != nil {
+		return nil, err
+	}
+	account, err := s.db.GetAccountByID(accountID)
+	if err != nil {
+		return nil, err
+	}
+	if account.UserID == nil {
+		return nil, nil
+	}
+
+	// A password change invalidates every existing device proof immediately.
+	// Each client must prove the new password before a fresh node lease is issued.
+	return s.reconcileAccountNodes(account.UserID, now, now)
+}
+
+// BeginAccountAuthentication locks an account operation and revalidates the
+// credential snapshot immediately before a node registration or renewal.
+// The caller must invoke the returned unlock function.
+func (s *State) BeginAccountAuthentication(
+	accountID uint,
+	passwordVersion uint64,
+	now time.Time,
+) (*types.Account, func(), error) {
+	unlock := s.accountOperationLocks.lock(accountID)
+	account, err := s.db.GetAccountByID(accountID)
+	if err != nil {
+		unlock()
+		return nil, nil, err
+	}
+	if account.PasswordVersion != passwordVersion {
+		unlock()
+		return nil, nil, hsdb.ErrAccountConcurrentUpdate
+	}
+	if !account.Enabled {
+		unlock()
+		return nil, nil, hsdb.ErrAccountDisabled
+	}
+	if account.ExpiresAt != nil && !account.ExpiresAt.After(now) {
+		unlock()
+		return nil, nil, hsdb.ErrAccountExpired
+	}
+	if account.PasswordExpired(now) {
+		unlock()
+		return nil, nil, hsdb.ErrAccountPasswordExpired
+	}
+
+	return account, unlock, nil
+}
+
+func accountNodeExpiry(account *types.Account, now time.Time) time.Time {
+	if account == nil || account.UserID == nil || !account.Enabled || account.PasswordExpired(now) {
+		return now
+	}
+
+	expiry := account.PasswordChangedAt.Add(types.AccountPasswordMaxAge)
+	if account.ExpiresAt != nil && account.ExpiresAt.Before(expiry) {
+		expiry = *account.ExpiresAt
+	}
+	if !expiry.After(now) {
+		return now
+	}
+
+	return expiry
+}
+
+func (s *State) reconcileAccountNodeExpiries(now time.Time) error {
+	accounts, err := s.db.ListAccounts()
+	if err != nil {
+		return fmt.Errorf("listing accounts for node expiry reconciliation: %w", err)
+	}
+	for idx := range accounts {
+		if _, err := s.reconcileAccountNodes(
+			accounts[idx].UserID,
+			accountNodeExpiry(&accounts[idx], now),
+			now,
+		); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// reconcileAccountNodes applies account lifetime changes to its network's
+// nodes. Expired nodes are never resurrected; re-enabling an account or
+// changing an already-expired password requires a fresh account login.
+func (s *State) reconcileAccountNodes(
+	userID *uint,
+	expiry,
+	now time.Time,
+) ([]change.Change, error) {
+	if userID == nil {
+		return nil, nil
+	}
+
+	nodes := s.ListNodesByUser(types.UserID(*userID))
+	changes := make([]change.Change, 0, nodes.Len())
+	for _, node := range nodes.All() {
+		if node.IsExpired() && expiry.After(now) {
+			continue
+		}
+		if current := node.Expiry(); current.Valid() {
+			// Reconciliation is fail-closed: account state may shorten a lease,
+			// but it never extends a manually shortened or already-expired lease.
+			if !current.Get().After(expiry) {
+				continue
+			}
+		}
+
+		_, nodeChange, err := s.SetNodeExpiry(node.ID(), &expiry)
+		if err != nil {
+			return changes, fmt.Errorf("updating account node %d expiry: %w", node.ID(), err)
+		}
+		changes = append(changes, nodeChange)
+	}
+
+	return changes, nil
 }
 
 // ListUsersWithFilter retrieves users matching the specified filter criteria.
@@ -881,13 +1242,17 @@ func (s *State) ListEphemeralNodes() views.Slice[types.NodeView] {
 }
 
 // SetNodeExpiry updates the expiration time for a node.
-// If expiry is nil, the node's expiry is disabled (node will never expire).
+// If persistence fails, the in-memory value is restored before returning.
 func (s *State) SetNodeExpiry(nodeID types.NodeID, expiry *time.Time) (types.NodeView, change.Change, error) {
-	// Update NodeStore before database to ensure consistency. The NodeStore update is
-	// blocking and will be the source of truth for the batcher. The database update must
-	// make the exact same change. If the database update fails, the NodeStore change will
-	// remain, but since we return an error, no change notification will be sent to the
-	// batcher, preventing inconsistent state propagation.
+	previous, exists := s.nodeStore.GetNode(nodeID)
+	if !exists {
+		return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, nodeID)
+	}
+	var oldExpiry *time.Time
+	if value := previous.Expiry(); value.Valid() {
+		copy := value.Get()
+		oldExpiry = &copy
+	}
 	n, ok := s.nodeStore.UpdateNode(nodeID, func(node *types.Node) {
 		node.Expiry = expiry
 	})
@@ -899,6 +1264,9 @@ func (s *State) SetNodeExpiry(nodeID types.NodeID, expiry *time.Time) (types.Nod
 	// Persist expiry change to database directly since persistNodeToDB omits expiry.
 	err := s.db.NodeSetExpiry(nodeID, expiry)
 	if err != nil {
+		_, _ = s.nodeStore.UpdateNode(nodeID, func(node *types.Node) {
+			node.Expiry = oldExpiry
+		})
 		return types.NodeView{}, change.Change{}, fmt.Errorf("setting node expiry in database: %w", err)
 	}
 
@@ -1150,14 +1518,6 @@ func (s *State) SSHPolicy(node types.NodeView) (*tailcfg.SSHPolicy, error) {
 	return s.polMan.SSHPolicy(s.cfg.ServerURL, node)
 }
 
-// SSHCheckParams resolves the SSH check period for a source-destination
-// node pair from the current policy.
-func (s *State) SSHCheckParams(
-	srcNodeID, dstNodeID types.NodeID,
-) (time.Duration, bool) {
-	return s.polMan.SSHCheckParams(srcNodeID, dstNodeID)
-}
-
 // Filter returns the current network filter rules and matches.
 func (s *State) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
 	return s.polMan.Filter()
@@ -1184,9 +1544,6 @@ func (s *State) SetPolicy(pol []byte) (bool, error) {
 	if err != nil {
 		return changed, err
 	}
-
-	// Clear SSH check auth times when policy changes.
-	s.ClearSSHCheckAuth()
 
 	return changed, nil
 }
@@ -1448,35 +1805,6 @@ func (s *State) GetAuthCacheEntry(id types.AuthID) (*types.AuthRequest, bool) {
 // SetAuthCacheEntry stores a pending auth request in the cache.
 func (s *State) SetAuthCacheEntry(id types.AuthID, entry *types.AuthRequest) {
 	s.authCache.Add(id, entry)
-}
-
-// SetLastSSHAuth records a successful SSH check authentication
-// for the given (src, dst) node pair.
-func (s *State) SetLastSSHAuth(src, dst types.NodeID) {
-	s.sshCheckMu.Lock()
-	defer s.sshCheckMu.Unlock()
-
-	s.sshCheckAuth[sshCheckPair{Src: src, Dst: dst}] = time.Now()
-}
-
-// GetLastSSHAuth returns when src last authenticated for SSH check
-// to dst.
-func (s *State) GetLastSSHAuth(src, dst types.NodeID) (time.Time, bool) {
-	s.sshCheckMu.RLock()
-	defer s.sshCheckMu.RUnlock()
-
-	t, ok := s.sshCheckAuth[sshCheckPair{Src: src, Dst: dst}]
-
-	return t, ok
-}
-
-// ClearSSHCheckAuth clears all recorded SSH check auth times.
-// Called when the policy changes to ensure stale auth times don't grant access.
-func (s *State) ClearSSHCheckAuth() {
-	s.sshCheckMu.Lock()
-	defer s.sshCheckMu.Unlock()
-
-	s.sshCheckAuth = make(map[sshCheckPair]time.Time)
 }
 
 // preserveNetInfo preserves NetInfo from an existing node for faster DERP connectivity.
@@ -1746,10 +2074,13 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 		nodeToRegister.AuthKey = params.PreAuthKey
 		nodeToRegister.AuthKeyID = &params.PreAuthKey.ID
 	} else {
-		// Non-PreAuthKey registration (OIDC, CLI) - always user-owned
+		// Account-authenticated registration is always user-owned.
 		nodeToRegister.UserID = &params.User.ID
 		nodeToRegister.User = &params.User
 		nodeToRegister.Tags = nil
+	}
+	if params.RegisterMethod == util.RegisterMethodPassword && params.Hostinfo != nil && len(params.Hostinfo.RequestTags) > 0 {
+		return types.NodeView{}, errors.New("account-authenticated nodes cannot use identity tags")
 	}
 
 	// Reject advertise-tags for PreAuthKey registrations early, before any resource allocation.
@@ -1760,7 +2091,7 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 
 	// Process RequestTags (from tailscale up --advertise-tags) ONLY for non-PreAuthKey registrations.
 	// Validate early before IP allocation to avoid resource leaks on failure.
-	if params.PreAuthKey == nil && params.Hostinfo != nil && len(params.Hostinfo.RequestTags) > 0 {
+	if params.PreAuthKey == nil && params.RegisterMethod != util.RegisterMethodPassword && params.Hostinfo != nil && len(params.Hostinfo.RequestTags) > 0 {
 		// Validate all tags before applying - reject if any tag is not permitted
 		rejectedTags := s.validateRequestTags(nodeToRegister.View(), params.Hostinfo.RequestTags)
 		if len(rejectedTags) > 0 {
@@ -1963,20 +2294,32 @@ func (s *State) HandleNodeFromAuthPath(
 	userID types.UserID,
 	expiry *time.Time,
 	registrationMethod string,
-) (types.NodeView, change.Change, error) {
+) (nodeResult types.NodeView, changeResult change.Change, retErr error) {
 	// Get the registration entry from cache
 	regEntry, ok := s.GetAuthCacheEntry(authID)
 	if !ok {
 		return types.NodeView{}, change.Change{}, hsdb.ErrNodeNotFoundRegistrationCache
 	}
 
+	regData, ok := regEntry.RegistrationDataOK()
+	if !ok {
+		return types.NodeView{}, change.Change{}, ErrAuthRequestNotRegistration
+	}
+	if !regEntry.TryClaimRegistration() {
+		return types.NodeView{}, change.Change{}, ErrAuthRequestAlreadyClaimed
+	}
+
+	defer func() {
+		if retErr != nil {
+			regEntry.FinishAuth(types.AuthVerdict{Err: retErr})
+		}
+	}()
+
 	// Get the user
 	user, err := s.db.GetUserByID(userID)
 	if err != nil {
 		return types.NodeView{}, change.Change{}, fmt.Errorf("finding user: %w", err)
 	}
-
-	regData := regEntry.RegistrationData()
 
 	// Hostname was already validated/normalised at producer time. Build
 	// the initial Hostinfo from the cached client-supplied Hostinfo (or
@@ -1992,6 +2335,9 @@ func (s *State) HandleNodeFromAuthPath(
 
 	// Lookup existing nodes
 	machineKey := regData.MachineKey
+	if registrationMethod == util.RegisterMethodPassword {
+		defer s.lockUserRegistration(userID)()
+	}
 	defer s.lockRegistration(machineKey)()
 
 	all := s.nodeStore.GetNodesByMachineKeyAllUsers(machineKey)
@@ -2015,10 +2361,15 @@ func (s *State) HandleNodeFromAuthPath(
 	if existingNodeIsTagged && (nodeExistsForSameUser || existingNodeOwnedByOtherUser) {
 		return types.NodeView{}, change.Change{}, ErrAmbiguousNodeOwnership
 	}
+	createsNewNode := !nodeExistsForSameUser && !existingNodeIsTagged
+	if registrationMethod == util.RegisterMethodPassword && createsNewNode &&
+		s.cfg.ScaleForge.MaxNodesPerAccount > 0 &&
+		s.ListNodesByUser(userID).Len() >= s.cfg.ScaleForge.MaxNodesPerAccount {
+		return types.NodeView{}, change.Change{}, ErrAccountNodeLimitReached
+	}
 
 	// Create logger with common fields for all auth operations
 	logger := log.With().
-		Str(zf.RegistrationID, authID.String()).
 		Str(zf.UserName, user.Name).
 		Str(zf.MachineKey, machineKey.ShortString()).
 		Str(zf.Method, registrationMethod).
@@ -2081,12 +2432,6 @@ func (s *State) HandleNodeFromAuthPath(
 		}
 	}
 
-	// Signal to waiting clients
-	regEntry.FinishAuth(types.AuthVerdict{Node: finalNode})
-
-	// Remove from registration cache
-	s.authCache.Remove(authID)
-
 	// Update policy managers
 	usersChange, err := s.updatePolicyManagerUsers()
 	if err != nil {
@@ -2104,6 +2449,9 @@ func (s *State) HandleNodeFromAuthPath(
 	} else {
 		c = change.NodeAdded(finalNode.ID())
 	}
+
+	// Publish success only after policy state is consistent with the node.
+	regEntry.FinishAuth(types.AuthVerdict{Node: finalNode})
 
 	return finalNode, c, nil
 }

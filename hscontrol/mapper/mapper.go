@@ -115,14 +115,14 @@ func generateUserProfiles(
 }
 
 func generateDNSConfig(
-	cfg *types.Config,
+	config *tailcfg.DNSConfig,
 	node types.NodeView,
 ) *tailcfg.DNSConfig {
-	if cfg.TailcfgDNSConfig == nil {
+	if config == nil {
 		return nil
 	}
 
-	dnsConfig := cfg.TailcfgDNSConfig.Clone()
+	dnsConfig := config.Clone()
 
 	addNextDNSMetadata(dnsConfig.Resolvers, node)
 
