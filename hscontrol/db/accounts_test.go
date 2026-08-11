@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -629,6 +630,16 @@ func TestMigrateScaleTailAccounts(t *testing.T) {
 	).Error; err != nil {
 		t.Fatalf("writing email fallback identity: %v", err)
 	}
+	nullableUser := types.User{Name: "nullable-source"}
+	if err := gormDB.Create(&nullableUser).Error; err != nil {
+		t.Fatalf("creating nullable legacy user: %v", err)
+	}
+	if err := gormDB.Exec(
+		"UPDATE users SET name = NULL, email = NULL, password = ?, role = NULL, enable = ? WHERE id = ?",
+		"plain:nullable-password", "true", nullableUser.ID,
+	).Error; err != nil {
+		t.Fatalf("writing nullable legacy identity: %v", err)
+	}
 
 	if err := migrateScaleTailAccounts(gormDB); err != nil {
 		t.Fatalf("migrating accounts: %v", err)
@@ -647,6 +658,13 @@ func TestMigrateScaleTailAccounts(t *testing.T) {
 	}
 	if fallbackAccount.UserID == nil || *fallbackAccount.UserID != fallbackUser.ID {
 		t.Fatalf("unexpected email fallback account: %+v", fallbackAccount)
+	}
+	var nullableAccount types.Account
+	if err := gormDB.Where("username = ?", fmt.Sprintf("account-%d", nullableUser.ID)).First(&nullableAccount).Error; err != nil {
+		t.Fatalf("finding nullable-source account: %v", err)
+	}
+	if nullableAccount.UserID == nil || *nullableAccount.UserID != nullableUser.ID {
+		t.Fatalf("unexpected nullable-source account: %+v", nullableAccount)
 	}
 	for _, column := range legacyUserAccountColumns {
 		if !gormDB.Migrator().HasColumn("users", column) {

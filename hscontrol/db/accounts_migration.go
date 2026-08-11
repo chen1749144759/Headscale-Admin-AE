@@ -47,11 +47,11 @@ func migrateScaleTailAccounts(tx *gorm.DB) error {
 		rows, err := tx.Table("users").
 			Select(strings.Join([]string{
 				"id",
-				legacyAccountColumn(tx, "name", "''"),
-				legacyAccountColumn(tx, "email", "''"),
+				legacyAccountTextColumn(tx, "name"),
+				legacyAccountTextColumn(tx, "email"),
 				"password",
 				legacyAccountColumn(tx, "expire", "NULL"),
-				legacyAccountColumn(tx, "role", "''"),
+				legacyAccountTextColumn(tx, "role"),
 				legacyAccountTextColumn(tx, "enable"),
 				legacyAccountColumn(tx, "created_at", "NULL"),
 				legacyAccountColumn(tx, "updated_at", "NULL"),
