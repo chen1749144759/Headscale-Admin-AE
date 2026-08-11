@@ -1851,9 +1851,9 @@ type authNodeUpdateParams struct {
 	User *types.User
 	// Overrides RegData.Expiry; ignored for tagged nodes.
 	Expiry *time.Time
-	// Only used when IsConvertFromTag=true.
+	// Registration method selected by the completed authentication flow.
 	RegisterMethod string
-	// Set true for tagged->user conversion. Affects RegisterMethod and expiry.
+	// Set true for tagged-to-user conversion. Affects conversion logging and expiry.
 	IsConvertFromTag bool
 }
 
@@ -1928,11 +1928,9 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 		// to peers, even though Connect() will immediately set it back to true.
 		node.LastSeen = new(time.Now())
 
-		// On conversion (tagged → user) we set the new register method.
-		// On plain reauth we preserve the existing node.RegisterMethod;
-		// the cached RegistrationData no longer carries it because the
-		// producer never populated it.
-		if params.IsConvertFromTag {
+		// The completed authentication flow supplies the authoritative method.
+		// This also migrates legacy auth-key nodes after password reauthentication.
+		if params.RegisterMethod != "" {
 			node.RegisterMethod = params.RegisterMethod
 		}
 
