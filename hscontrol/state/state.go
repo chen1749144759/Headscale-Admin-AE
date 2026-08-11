@@ -616,7 +616,27 @@ func (s *State) AuthenticateAccount(
 }
 
 func (s *State) CreateAccount(params hsdb.CreateAccountParams) (*types.Account, error) {
-	return s.db.CreateAccount(params)
+	account, err := s.db.CreateAccount(params)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.updatePolicyManagerUsers(); err != nil {
+		return account, fmt.Errorf("updating policy manager after account creation: %w", err)
+	}
+
+	return account, nil
+}
+
+func (s *State) ListAccountGroups() ([]types.AccountGroup, error) {
+	return s.db.ListAccountGroups()
+}
+
+func (s *State) CreateAccountGroup(name string) (*types.AccountGroup, error) {
+	return s.db.CreateAccountGroup(name)
+}
+
+func (s *State) DeleteAccountGroup(groupID uint) error {
+	return s.db.DeleteAccountGroup(groupID)
 }
 
 func (s *State) CountAccounts() (int64, error) {
@@ -675,6 +695,15 @@ func (s *State) UpdateAccount(
 		changes = append(changes, nodeChanges...)
 		if reconcileErr != nil {
 			return updated, changes, reconcileErr
+		}
+	}
+	if params.Username != nil {
+		policyChange, policyErr := s.updatePolicyManagerUsers()
+		if policyErr != nil {
+			return updated, changes, fmt.Errorf("updating policy manager after account rename: %w", policyErr)
+		}
+		if !policyChange.IsEmpty() {
+			changes = append(changes, policyChange)
 		}
 	}
 
@@ -2361,8 +2390,7 @@ func (s *State) HandleNodeFromAuthPath(
 	}
 	createsNewNode := !nodeExistsForSameUser && !existingNodeIsTagged
 	if registrationMethod == util.RegisterMethodPassword && createsNewNode &&
-		s.cfg.ScaleForge.MaxNodesPerAccount > 0 &&
-		s.ListNodesByUser(userID).Len() >= s.cfg.ScaleForge.MaxNodesPerAccount {
+		s.ListNodesByUser(userID).Len() >= 1 {
 		return types.NodeView{}, change.Change{}, ErrAccountNodeLimitReached
 	}
 

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -25,7 +26,9 @@ var (
 	ErrAccountDisabled           = errors.New("account is disabled")
 	ErrAccountExpired            = errors.New("account is expired")
 	ErrAccountPasswordExpired    = errors.New("password has expired")
-	ErrAccountHasNoNetwork       = errors.New("account is not assigned to a network")
+	ErrAccountUsernameExists     = errors.New("account username already exists")
+	ErrAccountHasNoGroup         = errors.New("account is not assigned to a group")
+	ErrAccountGroupNotFound      = errors.New("account group not found")
 	ErrAccountPasswordReused     = errors.New("new password must be different")
 	ErrAccountConcurrentUpdate   = errors.New("account changed concurrently")
 	ErrAccountBootstrapComplete  = errors.New("account bootstrap has already completed")
@@ -39,7 +42,7 @@ var (
 type CreateAccountParams struct {
 	Username              string
 	Password              string
-	UserID                *types.UserID
+	GroupID               *uint
 	Role                  string
 	Enabled               bool
 	ExpiresAt             *time.Time
@@ -53,8 +56,8 @@ type UpdateAccountParams struct {
 	Enabled        *bool
 	ExpiresAt      *time.Time
 	ClearExpiresAt bool
-	UserID         *types.UserID
-	ClearUser      bool
+	GroupID        *uint
+	ClearGroup     bool
 	ActorAccountID *uint
 }
 
@@ -94,7 +97,7 @@ func (hsdb *HSDatabase) ValidateManagerAccountInvariant() error {
 
 func (hsdb *HSDatabase) ListAccounts() ([]types.Account, error) {
 	var accounts []types.Account
-	if err := hsdb.DB.Preload("User").Order("id ASC").Find(&accounts).Error; err != nil {
+	if err := hsdb.DB.Preload("User").Preload("Group").Order("id ASC").Find(&accounts).Error; err != nil {
 		return nil, fmt.Errorf("listing accounts: %w", err)
 	}
 
@@ -103,7 +106,7 @@ func (hsdb *HSDatabase) ListAccounts() ([]types.Account, error) {
 
 func (hsdb *HSDatabase) GetAccountByID(accountID uint) (*types.Account, error) {
 	var account types.Account
-	result := hsdb.DB.Preload("User").First(&account, accountID)
+	result := hsdb.DB.Preload("User").Preload("Group").First(&account, accountID)
 	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 		return nil, gorm.ErrRecordNotFound
 	}
@@ -142,10 +145,10 @@ func (hsdb *HSDatabase) UpdateAccount(
 	} else if params.ExpiresAt != nil {
 		updates["expires_at"] = *params.ExpiresAt
 	}
-	if params.ClearUser {
-		updates["user_id"] = nil
-	} else if params.UserID != nil {
-		updates["user_id"] = uint(*params.UserID)
+	if params.ClearGroup {
+		updates["group_id"] = nil
+	} else if params.GroupID != nil {
+		updates["group_id"] = *params.GroupID
 	}
 	if len(updates) == 0 {
 		return hsdb.GetAccountByID(accountID)
@@ -176,15 +179,12 @@ func (hsdb *HSDatabase) UpdateAccount(
 		} else if params.ExpiresAt != nil {
 			nextHasExpiry = true
 		}
-		nextUserID := current.UserID
-		if params.ClearUser {
-			nextUserID = nil
-		} else if params.UserID != nil {
-			value := uint(*params.UserID)
-			nextUserID = &value
-		}
-		if nextRole == types.AccountRoleUser && nextUserID == nil {
-			return ErrAccountHasNoNetwork
+		nextGroupID := current.GroupID
+		if params.ClearGroup {
+			nextGroupID = nil
+		} else if params.GroupID != nil {
+			value := *params.GroupID
+			nextGroupID = &value
 		}
 		if current.Role == types.AccountRoleManager && current.Enabled &&
 			(nextRole != types.AccountRoleManager || !nextEnabled || nextHasExpiry) {
@@ -199,6 +199,18 @@ func (hsdb *HSDatabase) UpdateAccount(
 				return ErrLastManager
 			}
 		}
+		if nextRole == types.AccountRoleUser && nextGroupID == nil {
+			return ErrAccountHasNoGroup
+		}
+		if nextGroupID != nil {
+			var count int64
+			if err := tx.Model(&types.AccountGroup{}).Where("id = ?", *nextGroupID).Count(&count).Error; err != nil {
+				return fmt.Errorf("checking account group: %w", err)
+			}
+			if count == 0 {
+				return ErrAccountGroupNotFound
+			}
+		}
 
 		result := tx.Model(&types.Account{}).Where("id = ?", accountID).Updates(updates)
 		if result.Error != nil {
@@ -206,6 +218,19 @@ func (hsdb *HSDatabase) UpdateAccount(
 		}
 		if result.RowsAffected == 0 {
 			return gorm.ErrRecordNotFound
+		}
+		if username, ok := updates["username"].(string); ok && current.UserID != nil {
+			providerIdentifier := sql.NullString{String: "account:" + username, Valid: true}
+			result := tx.Model(&types.User{}).Where("id = ?", *current.UserID).Updates(map[string]any{
+				"name":                "account-" + username,
+				"provider_identifier": providerIdentifier,
+			})
+			if result.Error != nil {
+				return fmt.Errorf("renaming account network identity: %w", result.Error)
+			}
+			if result.RowsAffected == 0 {
+				return fmt.Errorf("renaming account network identity: %w", gorm.ErrRecordNotFound)
+			}
 		}
 
 		if err := tx.Model(&types.AccountSession{}).
@@ -217,11 +242,6 @@ func (hsdb *HSDatabase) UpdateAccount(
 		var updated types.Account
 		if err := tx.First(&updated, accountID).Error; err != nil {
 			return fmt.Errorf("reading updated account: %w", err)
-		}
-		if current.UserID != nil && (updated.UserID == nil || *current.UserID != *updated.UserID) {
-			if err := clampAccountNodes(tx, current.UserID, now); err != nil {
-				return err
-			}
 		}
 		if err := clampAccountNodes(tx, updated.UserID, accountNodeExpiry(&updated, now)); err != nil {
 			return err
@@ -505,20 +525,15 @@ func (hsdb *HSDatabase) CreateAccount(params CreateAccountParams) (*types.Accoun
 		return nil, errors.New("invalid account role")
 	}
 
-	var userID *uint
-	if params.UserID != nil {
-		uid := uint(*params.UserID)
-		userID = &uid
-	}
-	if role == types.AccountRoleUser && userID == nil {
-		return nil, ErrAccountHasNoNetwork
+	if role == types.AccountRoleUser && params.GroupID == nil {
+		return nil, ErrAccountHasNoGroup
 	}
 
 	now := time.Now().UTC()
 	account := &types.Account{
 		Username:           username,
 		PasswordHash:       passwordHash,
-		UserID:             userID,
+		GroupID:            params.GroupID,
 		Role:               role,
 		Enabled:            params.Enabled,
 		ExpiresAt:          params.ExpiresAt,
@@ -528,6 +543,32 @@ func (hsdb *HSDatabase) CreateAccount(params CreateAccountParams) (*types.Accoun
 	}
 
 	if err := hsdb.Write(func(tx *gorm.DB) error {
+		var usernameCount int64
+		if err := tx.Model(&types.Account{}).Where("username = ?", username).Count(&usernameCount).Error; err != nil {
+			return fmt.Errorf("checking account username: %w", err)
+		}
+		if usernameCount > 0 {
+			return ErrAccountUsernameExists
+		}
+		if params.GroupID != nil {
+			var count int64
+			if err := tx.Model(&types.AccountGroup{}).Where("id = ?", *params.GroupID).Count(&count).Error; err != nil {
+				return fmt.Errorf("checking account group: %w", err)
+			}
+			if count == 0 {
+				return ErrAccountGroupNotFound
+			}
+		}
+
+		networkUser := types.User{
+			Name:               "account-" + username,
+			Provider:           "scaleforge-account",
+			ProviderIdentifier: sql.NullString{String: "account:" + username, Valid: true},
+		}
+		if err := tx.Create(&networkUser).Error; err != nil {
+			return fmt.Errorf("creating account network identity: %w", err)
+		}
+		account.UserID = &networkUser.ID
 		if err := tx.Create(account).Error; err != nil {
 			return err
 		}

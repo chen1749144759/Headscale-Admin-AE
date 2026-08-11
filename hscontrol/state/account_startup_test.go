@@ -36,15 +36,14 @@ func TestNewStateAllowsBootstrapRecoveryWithoutDurableManager(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating initial state: %v", err)
 	}
-	user, err := first.db.CreateUser(types.User{Name: "ordinary-network"})
+	group, err := first.db.CreateAccountGroup("ordinary-group")
 	if err != nil {
-		t.Fatalf("creating user network: %v", err)
+		t.Fatalf("creating account group: %v", err)
 	}
-	userID := types.UserID(user.ID)
 	if _, err := first.db.CreateAccount(db.CreateAccountParams{
 		Username: "ordinary-user",
 		Password: "correct horse battery staple",
-		UserID:   &userID,
+		GroupID:  &group.ID,
 		Role:     types.AccountRoleUser,
 		Enabled:  true,
 	}); err != nil {

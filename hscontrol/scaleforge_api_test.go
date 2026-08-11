@@ -63,15 +63,14 @@ func signScaleForgeAPITestRequest(t *testing.T, app *Headscale, req *http.Reques
 
 func TestBootstrapScaleForgeAccountRejectsExistingAccountsWithoutDurableManager(t *testing.T) {
 	app := newScaleForgeAPITestHeadscale(t)
-	user, _, err := app.state.CreateUser(types.User{Name: "ordinary-network"})
+	group, err := app.state.CreateAccountGroup("ordinary-group")
 	if err != nil {
-		t.Fatalf("creating user network: %v", err)
+		t.Fatalf("creating account group: %v", err)
 	}
-	userID := types.UserID(user.ID)
 	if _, err := app.state.CreateAccount(hsdb.CreateAccountParams{
 		Username: "ordinary-user",
 		Password: "correct horse battery staple",
-		UserID:   &userID,
+		GroupID:  &group.ID,
 		Role:     types.AccountRoleUser,
 		Enabled:  true,
 	}); err != nil {
@@ -86,15 +85,14 @@ func TestBootstrapScaleForgeAccountRejectsExistingAccountsWithoutDurableManager(
 
 func TestBootstrapScaleForgeAccountRecoversExistingAccounts(t *testing.T) {
 	app := newScaleForgeAPITestHeadscale(t)
-	user, _, err := app.state.CreateUser(types.User{Name: "ordinary-network"})
+	group, err := app.state.CreateAccountGroup("ordinary-group")
 	if err != nil {
-		t.Fatalf("creating user network: %v", err)
+		t.Fatalf("creating account group: %v", err)
 	}
-	userID := types.UserID(user.ID)
 	if _, err := app.state.CreateAccount(hsdb.CreateAccountParams{
 		Username: "ordinary-user",
 		Password: "correct horse battery staple",
-		UserID:   &userID,
+		GroupID:  &group.ID,
 		Role:     types.AccountRoleUser,
 		Enabled:  true,
 	}); err != nil {
@@ -191,28 +189,31 @@ func TestScaleForgeGatewayRequiresScopedSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating manager: %v", err)
 	}
-	userNetwork := types.User{Name: "user-network"}
-	createdUser, _, err := app.state.CreateUser(userNetwork)
+	group, err := app.state.CreateAccountGroup("user-group")
 	if err != nil {
-		t.Fatalf("creating user network: %v", err)
+		t.Fatalf("creating account group: %v", err)
 	}
-	userID := types.UserID(createdUser.ID)
 	user, err := app.state.CreateAccount(hsdb.CreateAccountParams{
 		Username: "user",
 		Password: "correct horse battery staple",
-		UserID:   &userID,
+		GroupID:  &group.ID,
 		Role:     types.AccountRoleUser,
 		Enabled:  true,
 	})
 	if err != nil {
 		t.Fatalf("creating user account: %v", err)
 	}
+	boundUser, err := app.state.GetAccountByID(user.ID)
+	if err != nil || boundUser.User == nil {
+		t.Fatalf("loading account network identity: account=%+v err=%v", boundUser, err)
+	}
+	createdUser := *boundUser.User
 	otherNetwork := types.User{Name: "other-network"}
 	createdOtherUser, _, err := app.state.CreateUser(otherNetwork)
 	if err != nil {
 		t.Fatalf("creating other user network: %v", err)
 	}
-	ownedNode := app.state.CreateNodeForTest(createdUser, "owned-node")
+	ownedNode := app.state.CreateNodeForTest(&createdUser, "owned-node")
 	app.state.PutNodeInStoreForTest(*ownedNode)
 	otherNode := app.state.CreateNodeForTest(createdOtherUser, "other-node")
 	app.state.PutNodeInStoreForTest(*otherNode)

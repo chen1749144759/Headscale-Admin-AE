@@ -39,6 +39,8 @@ type scaleForgeAccountResponse struct {
 	LastLoginAt        *time.Time `json:"lastLoginAt,omitempty"`
 	UserID             *uint      `json:"userId,omitempty"`
 	NetworkName        string     `json:"networkName,omitempty"`
+	GroupID            *uint      `json:"groupId,omitempty"`
+	GroupName          string     `json:"groupName,omitempty"`
 }
 
 func scaleForgeAccountDTO(account *types.Account) scaleForgeAccountResponse {
@@ -52,9 +54,13 @@ func scaleForgeAccountDTO(account *types.Account) scaleForgeAccountResponse {
 		MustChangePassword: account.MustChangePassword,
 		LastLoginAt:        account.LastLoginAt,
 		UserID:             account.UserID,
+		GroupID:            account.GroupID,
 	}
 	if account.User != nil {
 		response.NetworkName = account.User.Name
+	}
+	if account.Group != nil {
+		response.GroupName = account.Group.Name
 	}
 
 	return response
@@ -139,6 +145,9 @@ func (h *Headscale) newScaleForgeAPIServer(headscaleAPI http.Handler) *http.Serv
 	router.Post("/v1/accounts", api.createAccount)
 	router.Patch("/v1/accounts/{accountID}", api.updateAccount)
 	router.Put("/v1/accounts/{accountID}/password", api.resetAccountPassword)
+	router.Get("/v1/groups", api.listAccountGroups)
+	router.Post("/v1/groups", api.createAccountGroup)
+	router.Delete("/v1/groups/{groupID}", api.deleteAccountGroup)
 	router.Get("/v1/dns", api.getDNS)
 	router.Put("/v1/dns", api.updateDNS)
 
@@ -162,6 +171,24 @@ func writeScaleForgeJSON(writer http.ResponseWriter, status int, value any) {
 
 func writeScaleForgeError(writer http.ResponseWriter, status int, code, message string) {
 	writeScaleForgeJSON(writer, status, map[string]string{"code": code, "error": message})
+}
+
+func writeScaleForgeAccountMutationError(writer http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, hsdb.ErrAccountUsernameExists):
+		writeScaleForgeError(writer, http.StatusConflict, "username_exists", "username already exists")
+	case errors.Is(err, hsdb.ErrAccountHasNoGroup):
+		writeScaleForgeError(writer, http.StatusBadRequest, "group_required", "user account requires a group")
+	case errors.Is(err, hsdb.ErrAccountGroupNotFound):
+		writeScaleForgeError(writer, http.StatusNotFound, "group_not_found", "group not found")
+	case errors.Is(err, hsdb.ErrLastManager):
+		writeScaleForgeError(writer, http.StatusConflict, "last_manager", "at least one enabled manager is required")
+	case errors.Is(err, hsdb.ErrAccountConcurrentUpdate):
+		writeScaleForgeError(writer, http.StatusConflict, "account_changed", "account changed; reload and retry")
+	default:
+		log.Error().Err(err).Msg("mutating ScaleForge account")
+		writeScaleForgeError(writer, http.StatusBadRequest, "invalid_account", "account data is invalid")
+	}
 }
 
 func decodeScaleForgeJSON(writer http.ResponseWriter, req *http.Request, value any) bool {
@@ -444,12 +471,12 @@ func (api *scaleForgeAPI) createAccount(writer http.ResponseWriter, req *http.Re
 		return
 	}
 	var createRequest struct {
-		Username  string        `json:"username"`
-		Password  string        `json:"password"`
-		UserID    *types.UserID `json:"userId"`
-		Role      string        `json:"role"`
-		Enabled   *bool         `json:"enabled"`
-		ExpiresAt *time.Time    `json:"expiresAt"`
+		Username  string     `json:"username"`
+		Password  string     `json:"password"`
+		GroupID   *uint      `json:"groupId"`
+		Role      string     `json:"role"`
+		Enabled   *bool      `json:"enabled"`
+		ExpiresAt *time.Time `json:"expiresAt"`
 	}
 	if !decodeScaleForgeJSON(writer, req, &createRequest) {
 		return
@@ -462,7 +489,7 @@ func (api *scaleForgeAPI) createAccount(writer http.ResponseWriter, req *http.Re
 	account, err := api.headscale.state.CreateAccount(hsdb.CreateAccountParams{
 		Username:              createRequest.Username,
 		Password:              createRequest.Password,
-		UserID:                createRequest.UserID,
+		GroupID:               createRequest.GroupID,
 		Role:                  createRequest.Role,
 		Enabled:               enabled,
 		ExpiresAt:             createRequest.ExpiresAt,
@@ -470,7 +497,7 @@ func (api *scaleForgeAPI) createAccount(writer http.ResponseWriter, req *http.Re
 		ActorAccountID:        &session.AccountID,
 	})
 	if err != nil {
-		writeScaleForgeError(writer, http.StatusBadRequest, "account_create_failed", err.Error())
+		writeScaleForgeAccountMutationError(writer, err)
 		return
 	}
 	if account.UserID != nil {
@@ -505,13 +532,13 @@ func (api *scaleForgeAPI) updateAccount(writer http.ResponseWriter, req *http.Re
 		return
 	}
 	var updateRequest struct {
-		Username       *string       `json:"username"`
-		Role           *string       `json:"role"`
-		Enabled        *bool         `json:"enabled"`
-		ExpiresAt      *time.Time    `json:"expiresAt"`
-		ClearExpiresAt bool          `json:"clearExpiresAt"`
-		UserID         *types.UserID `json:"userId"`
-		ClearUser      bool          `json:"clearUser"`
+		Username       *string    `json:"username"`
+		Role           *string    `json:"role"`
+		Enabled        *bool      `json:"enabled"`
+		ExpiresAt      *time.Time `json:"expiresAt"`
+		ClearExpiresAt bool       `json:"clearExpiresAt"`
+		GroupID        *uint      `json:"groupId"`
+		ClearGroup     bool       `json:"clearGroup"`
 	}
 	if !decodeScaleForgeJSON(writer, req, &updateRequest) {
 		return
@@ -523,8 +550,8 @@ func (api *scaleForgeAPI) updateAccount(writer http.ResponseWriter, req *http.Re
 		Enabled:        updateRequest.Enabled,
 		ExpiresAt:      updateRequest.ExpiresAt,
 		ClearExpiresAt: updateRequest.ClearExpiresAt,
-		UserID:         updateRequest.UserID,
-		ClearUser:      updateRequest.ClearUser,
+		GroupID:        updateRequest.GroupID,
+		ClearGroup:     updateRequest.ClearGroup,
 		ActorAccountID: &session.AccountID,
 	}, time.Now().UTC())
 	api.headscale.Change(changes...)
@@ -533,11 +560,81 @@ func (api *scaleForgeAPI) updateAccount(writer http.ResponseWriter, req *http.Re
 		return
 	}
 	if err != nil {
-		writeScaleForgeError(writer, http.StatusBadRequest, "account_update_failed", err.Error())
+		writeScaleForgeAccountMutationError(writer, err)
 		return
 	}
 
 	writeScaleForgeJSON(writer, http.StatusOK, scaleForgeAccountDTO(account))
+}
+
+type scaleForgeGroupResponse struct {
+	ID   uint   `json:"id"`
+	Name string `json:"name"`
+}
+
+func (api *scaleForgeAPI) listAccountGroups(writer http.ResponseWriter, req *http.Request) {
+	if _, _, ok := api.authenticatedSession(writer, req, true, false); !ok {
+		return
+	}
+	groups, err := api.headscale.state.ListAccountGroups()
+	if err != nil {
+		log.Error().Err(err).Msg("listing ScaleForge account groups")
+		writeScaleForgeError(writer, http.StatusInternalServerError, "internal_error", "unable to list groups")
+		return
+	}
+	response := make([]scaleForgeGroupResponse, 0, len(groups))
+	for idx := range groups {
+		response = append(response, scaleForgeGroupResponse{ID: groups[idx].ID, Name: groups[idx].Name})
+	}
+	writeScaleForgeJSON(writer, http.StatusOK, response)
+}
+
+func (api *scaleForgeAPI) createAccountGroup(writer http.ResponseWriter, req *http.Request) {
+	if _, _, ok := api.authenticatedSession(writer, req, true, false); !ok {
+		return
+	}
+	var createRequest struct {
+		Name string `json:"name"`
+	}
+	if !decodeScaleForgeJSON(writer, req, &createRequest) {
+		return
+	}
+	group, err := api.headscale.state.CreateAccountGroup(createRequest.Name)
+	if err != nil {
+		if errors.Is(err, hsdb.ErrAccountGroupExists) {
+			writeScaleForgeError(writer, http.StatusConflict, "group_exists", "group name already exists")
+			return
+		}
+		writeScaleForgeError(writer, http.StatusBadRequest, "invalid_group", "group name is invalid")
+		return
+	}
+	writeScaleForgeJSON(writer, http.StatusCreated, scaleForgeGroupResponse{ID: group.ID, Name: group.Name})
+}
+
+func (api *scaleForgeAPI) deleteAccountGroup(writer http.ResponseWriter, req *http.Request) {
+	if _, _, ok := api.authenticatedSession(writer, req, true, false); !ok {
+		return
+	}
+	parsed, err := strconv.ParseUint(chi.URLParam(req, "groupID"), 10, 32)
+	if err != nil || parsed == 0 {
+		writeScaleForgeError(writer, http.StatusBadRequest, "invalid_group_id", "invalid group ID")
+		return
+	}
+	err = api.headscale.state.DeleteAccountGroup(uint(parsed))
+	if errors.Is(err, hsdb.ErrAccountGroupInUse) {
+		writeScaleForgeError(writer, http.StatusConflict, "group_in_use", "group still contains users")
+		return
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		writeScaleForgeError(writer, http.StatusNotFound, "group_not_found", "group not found")
+		return
+	}
+	if err != nil {
+		log.Error().Err(err).Msg("deleting ScaleForge account group")
+		writeScaleForgeError(writer, http.StatusInternalServerError, "internal_error", "unable to delete group")
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
 }
 
 func (api *scaleForgeAPI) resetAccountPassword(writer http.ResponseWriter, req *http.Request) {

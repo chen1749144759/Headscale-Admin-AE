@@ -805,6 +805,13 @@ CREATE TABLE IF NOT EXISTS runtime_settings (
 				},
 				Rollback: func(db *gorm.DB) error { return nil },
 			},
+			{
+				// Business groups are reusable classifications. Headscale users are
+				// now private one-per-account protocol identities instead of groups.
+				ID:       "202608111500-create-account-groups",
+				Migrate:  migrateAccountGroups,
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
 		},
 	)
 
@@ -812,6 +819,7 @@ CREATE TABLE IF NOT EXISTS runtime_settings (
 		// Create all tables using AutoMigrate
 		err := tx.AutoMigrate(
 			&types.User{},
+			&types.AccountGroup{},
 			&types.Account{},
 			&types.AccountSession{},
 			&types.AccountPasswordHistory{},
@@ -830,8 +838,12 @@ CREATE TABLE IF NOT EXISTS runtime_settings (
 		dropIndexes := []string{
 			`DROP INDEX IF EXISTS "idx_users_deleted_at"`,
 			`DROP INDEX IF EXISTS "idx_accounts_deleted_at"`,
+			`DROP INDEX IF EXISTS "idx_account_groups_deleted_at"`,
+			`DROP INDEX IF EXISTS "idx_account_groups_name"`,
+			`DROP INDEX IF EXISTS "idx_account_groups_name_lower"`,
 			`DROP INDEX IF EXISTS "idx_accounts_username"`,
 			`DROP INDEX IF EXISTS "idx_accounts_user_id"`,
+			`DROP INDEX IF EXISTS "idx_accounts_group_id"`,
 			`DROP INDEX IF EXISTS "idx_account_sessions_token_hash"`,
 			`DROP INDEX IF EXISTS "idx_account_sessions_account_id"`,
 			`DROP INDEX IF EXISTS "idx_account_sessions_expires_at"`,
@@ -854,9 +866,13 @@ CREATE TABLE IF NOT EXISTS runtime_settings (
 		// Recreate indexes without backticks to match schema.sql format
 		indexes := []string{
 			`CREATE INDEX idx_users_deleted_at ON users(deleted_at)`,
+			`CREATE INDEX idx_account_groups_deleted_at ON account_groups(deleted_at)`,
+			`CREATE UNIQUE INDEX idx_account_groups_name ON account_groups(name)`,
+			`CREATE UNIQUE INDEX idx_account_groups_name_lower ON account_groups(LOWER(name)) WHERE deleted_at IS NULL`,
 			`CREATE INDEX idx_accounts_deleted_at ON accounts(deleted_at)`,
 			`CREATE UNIQUE INDEX idx_accounts_username ON accounts(username)`,
 			`CREATE UNIQUE INDEX idx_accounts_user_id ON accounts(user_id)`,
+			`CREATE INDEX idx_accounts_group_id ON accounts(group_id)`,
 			`CREATE UNIQUE INDEX idx_account_sessions_token_hash ON account_sessions(token_hash)`,
 			`CREATE INDEX idx_account_sessions_account_id ON account_sessions(account_id)`,
 			`CREATE INDEX idx_account_sessions_expires_at ON account_sessions(expires_at)`,

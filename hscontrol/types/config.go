@@ -138,7 +138,6 @@ type ScaleForgeConfig struct {
 	InternalAuthKeyFile   string
 	TrustProxy            bool
 	TrustedProxyCIDRs     []netip.Prefix
-	MaxNodesPerAccount    int
 	BootstrapUsername     string
 	BootstrapPasswordFile string
 }
@@ -429,7 +428,6 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("scaleforge.internal_auth_key_file", "/run/secrets/scaleforge_internal_auth_key")
 	viper.SetDefault("scaleforge.trust_proxy", false)
 	viper.SetDefault("scaleforge.trusted_proxy_cidrs", []string{})
-	viper.SetDefault("scaleforge.max_nodes_per_account", 20)
 
 	viper.SetDefault("cli.timeout", "5s")
 	viper.SetDefault("cli.insecure", false)
@@ -1247,7 +1245,6 @@ func LoadServerConfig() (*Config, error) {
 			InternalAuthKeyFile:   viper.GetString("scaleforge.internal_auth_key_file"),
 			TrustProxy:            viper.GetBool("scaleforge.trust_proxy"),
 			TrustedProxyCIDRs:     trustedProxyCIDRs,
-			MaxNodesPerAccount:    viper.GetInt("scaleforge.max_nodes_per_account"),
 			BootstrapUsername:     viper.GetString("scaleforge.bootstrap_username"),
 			BootstrapPasswordFile: viper.GetString("scaleforge.bootstrap_password_file"),
 		},

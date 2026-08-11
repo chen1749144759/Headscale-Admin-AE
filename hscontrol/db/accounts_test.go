@@ -23,6 +23,7 @@ func newAccountTestDatabase(t *testing.T) *HSDatabase {
 	}
 	if err := gormDB.AutoMigrate(
 		&types.User{},
+		&types.AccountGroup{},
 		&types.Account{},
 		&types.AccountSession{},
 		&types.AccountPasswordHistory{},
@@ -36,6 +37,15 @@ func newAccountTestDatabase(t *testing.T) *HSDatabase {
 	sqlDB.SetMaxOpenConns(1)
 
 	return &HSDatabase{DB: gormDB}
+}
+
+func createAccountTestGroup(t *testing.T, database *HSDatabase, name string) *types.AccountGroup {
+	t.Helper()
+	group, err := database.CreateAccountGroup(name)
+	if err != nil {
+		t.Fatalf("creating account group: %v", err)
+	}
+	return group
 }
 
 func TestAccountCredentialValidation(t *testing.T) {
@@ -93,15 +103,9 @@ func TestLastManagerCannotBeDisabledDemotedOrExpired(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			database := newAccountTestDatabase(t)
-			user := types.User{Name: "manager-network"}
-			if err := database.DB.Create(&user).Error; err != nil {
-				t.Fatalf("creating user: %v", err)
-			}
-			userID := types.UserID(user.ID)
 			manager, err := database.CreateAccount(CreateAccountParams{
 				Username: "only-manager",
 				Password: "correct horse battery staple",
-				UserID:   &userID,
 				Role:     types.AccountRoleManager,
 				Enabled:  true,
 			})
@@ -121,15 +125,9 @@ func TestManagerExpiryAllowedWhenAnotherDurableManagerExists(t *testing.T) {
 	database := newAccountTestDatabase(t)
 	var expiringManager *types.Account
 	for _, username := range []string{"durable-manager", "expiring-manager"} {
-		user := types.User{Name: username + "-network"}
-		if err := database.DB.Create(&user).Error; err != nil {
-			t.Fatalf("creating user: %v", err)
-		}
-		userID := types.UserID(user.ID)
 		account, err := database.CreateAccount(CreateAccountParams{
 			Username: username,
 			Password: "correct horse battery staple",
-			UserID:   &userID,
 			Role:     types.AccountRoleManager,
 			Enabled:  true,
 		})
@@ -156,15 +154,9 @@ func TestConcurrentLastManagerUpdatesKeepOneActiveManager(t *testing.T) {
 	now := time.Now().UTC()
 	managers := make([]*types.Account, 0, 2)
 	for _, name := range []string{"manager-one", "manager-two"} {
-		user := types.User{Name: name + "-network"}
-		if err := database.DB.Create(&user).Error; err != nil {
-			t.Fatalf("creating user: %v", err)
-		}
-		userID := types.UserID(user.ID)
 		manager, err := database.CreateAccount(CreateAccountParams{
 			Username: name,
 			Password: "correct horse battery staple",
-			UserID:   &userID,
 			Role:     types.AccountRoleManager,
 			Enabled:  true,
 		})
@@ -217,16 +209,11 @@ func TestConcurrentLastManagerUpdatesKeepOneActiveManager(t *testing.T) {
 
 func TestAuthenticateAccount(t *testing.T) {
 	database := newAccountTestDatabase(t)
-	user := types.User{Name: "engineering"}
-	if err := database.DB.Create(&user).Error; err != nil {
-		t.Fatalf("creating user: %v", err)
-	}
-
-	userID := types.UserID(user.ID)
+	group := createAccountTestGroup(t, database, "engineering")
 	account, err := database.CreateAccount(CreateAccountParams{
 		Username: "Alice",
 		Password: "correct horse battery staple",
-		UserID:   &userID,
+		GroupID:  &group.ID,
 		Role:     types.AccountRoleUser,
 		Enabled:  true,
 	})
@@ -243,7 +230,7 @@ func TestAuthenticateAccount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticating account: %v", err)
 	}
-	if authenticated.ID != account.ID || authenticated.User == nil || authenticated.User.ID != user.ID {
+	if authenticated.ID != account.ID || authenticated.User == nil || account.UserID == nil || authenticated.User.ID != *account.UserID {
 		t.Fatalf("unexpected authenticated account: %+v", authenticated)
 	}
 
@@ -252,40 +239,71 @@ func TestAuthenticateAccount(t *testing.T) {
 	}
 }
 
-func TestAccountNetworkAssignmentIsUnique(t *testing.T) {
+func TestAccountGroupCanContainMultipleIndependentUsers(t *testing.T) {
 	database := newAccountTestDatabase(t)
-	user := types.User{Name: "engineering"}
-	if err := database.DB.Create(&user).Error; err != nil {
-		t.Fatalf("creating user: %v", err)
-	}
-
-	userID := types.UserID(user.ID)
-	if _, err := database.CreateAccount(CreateAccountParams{
+	group := createAccountTestGroup(t, database, "RD")
+	alice, err := database.CreateAccount(CreateAccountParams{
 		Username: "alice",
 		Password: "correct horse battery staple",
-		UserID:   &userID,
+		GroupID:  &group.ID,
 		Enabled:  true,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("creating first account: %v", err)
 	}
-	if _, err := database.CreateAccount(CreateAccountParams{
+	bob, err := database.CreateAccount(CreateAccountParams{
 		Username: "bob",
 		Password: "another correct horse battery staple",
-		UserID:   &userID,
+		GroupID:  &group.ID,
 		Enabled:  true,
-	}); err == nil {
-		t.Fatal("assigned one network namespace to two accounts")
+	})
+	if err != nil {
+		t.Fatalf("creating second account in same group: %v", err)
+	}
+	if alice.UserID == nil || bob.UserID == nil || *alice.UserID == *bob.UserID {
+		t.Fatalf("accounts do not have independent network identities: alice=%v bob=%v", alice.UserID, bob.UserID)
+	}
+	if alice.GroupID == nil || bob.GroupID == nil || *alice.GroupID != group.ID || *bob.GroupID != group.ID {
+		t.Fatalf("accounts are not assigned to the shared group: alice=%v bob=%v", alice.GroupID, bob.GroupID)
 	}
 }
 
-func TestUserAccountRequiresNetwork(t *testing.T) {
+func TestUpdateAccountRenamesInternalNetworkIdentity(t *testing.T) {
+	database := newAccountTestDatabase(t)
+	group := createAccountTestGroup(t, database, "RD")
+	account, err := database.CreateAccount(CreateAccountParams{
+		Username: "alice",
+		Password: "correct horse battery staple",
+		GroupID:  &group.ID,
+		Role:     types.AccountRoleUser,
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("creating account: %v", err)
+	}
+	username := "alice-renamed"
+	updated, err := database.UpdateAccount(
+		account.ID,
+		UpdateAccountParams{Username: &username},
+		time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatalf("renaming account: %v", err)
+	}
+	if updated.User == nil || updated.User.Name != "account-alice-renamed" ||
+		!updated.User.ProviderIdentifier.Valid || updated.User.ProviderIdentifier.String != "account:alice-renamed" {
+		t.Fatalf("internal identity did not follow account rename: %+v", updated.User)
+	}
+}
+
+func TestUserAccountRequiresGroup(t *testing.T) {
 	database := newAccountTestDatabase(t)
 	if _, err := database.CreateAccount(CreateAccountParams{
 		Username: "unbound-user",
 		Password: "correct horse battery staple",
 		Role:     types.AccountRoleUser,
 		Enabled:  true,
-	}); !errors.Is(err, ErrAccountHasNoNetwork) {
+	}); !errors.Is(err, ErrAccountHasNoGroup) {
 		t.Fatalf("unbound user account error = %v", err)
 	}
 
@@ -298,8 +316,16 @@ func TestUserAccountRequiresNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating manager account: %v", err)
 	}
+	if _, err := database.CreateAccount(CreateAccountParams{
+		Username: "backup-manager",
+		Password: "correct horse battery staple",
+		Role:     types.AccountRoleManager,
+		Enabled:  true,
+	}); err != nil {
+		t.Fatalf("creating backup manager account: %v", err)
+	}
 	role := types.AccountRoleUser
-	if _, err := database.UpdateAccount(manager.ID, UpdateAccountParams{Role: &role}, time.Now().UTC()); !errors.Is(err, ErrAccountHasNoNetwork) {
+	if _, err := database.UpdateAccount(manager.ID, UpdateAccountParams{Role: &role}, time.Now().UTC()); !errors.Is(err, ErrAccountHasNoGroup) {
 		t.Fatalf("unbound manager-to-user update error = %v", err)
 	}
 }
@@ -514,16 +540,12 @@ func TestCreateAccountCanRequireInitialPasswordChange(t *testing.T) {
 
 func TestCreateAccountPersistsExpiry(t *testing.T) {
 	database := newAccountTestDatabase(t)
-	user := types.User{Name: "expiring-network"}
-	if err := database.DB.Create(&user).Error; err != nil {
-		t.Fatalf("creating user: %v", err)
-	}
-	userID := types.UserID(user.ID)
+	group := createAccountTestGroup(t, database, "expiring-group")
 	expiresAt := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
 	account, err := database.CreateAccount(CreateAccountParams{
 		Username:  "expiring-user",
 		Password:  "correct horse battery staple",
-		UserID:    &userID,
+		GroupID:   &group.ID,
 		Role:      types.AccountRoleUser,
 		Enabled:   true,
 		ExpiresAt: &expiresAt,

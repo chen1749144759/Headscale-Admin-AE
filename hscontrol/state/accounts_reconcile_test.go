@@ -36,15 +36,14 @@ func TestNewStateReconcilesDisabledAccountNodesOnSQLite(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("creating durable manager: %v", err)
 	}
-	user, err := first.db.CreateUser(types.User{Name: "account-network"})
+	group, err := first.db.CreateAccountGroup("account-group")
 	if err != nil {
-		t.Fatalf("creating user: %v", err)
+		t.Fatalf("creating account group: %v", err)
 	}
-	userID := types.UserID(user.ID)
 	account, err := first.db.CreateAccount(db.CreateAccountParams{
 		Username: "account-user",
 		Password: "correct horse battery staple",
-		UserID:   &userID,
+		GroupID:  &group.ID,
 		Role:     types.AccountRoleUser,
 		Enabled:  true,
 	})
@@ -52,7 +51,7 @@ func TestNewStateReconcilesDisabledAccountNodesOnSQLite(t *testing.T) {
 		t.Fatalf("creating account: %v", err)
 	}
 	future := time.Now().UTC().Add(time.Hour)
-	node := types.Node{UserID: &user.ID, RegisterMethod: "password", Expiry: &future}
+	node := types.Node{UserID: account.UserID, RegisterMethod: "password", Expiry: &future}
 	if err := first.db.DB.Create(&node).Error; err != nil {
 		t.Fatalf("creating node: %v", err)
 	}
@@ -95,22 +94,22 @@ func TestNewStateDoesNotExtendManuallyShortenedNodeExpiry(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("creating manager: %v", err)
 	}
-	user, err := first.db.CreateUser(types.User{Name: "short-lease-network"})
+	group, err := first.db.CreateAccountGroup("short-lease-group")
 	if err != nil {
-		t.Fatalf("creating user: %v", err)
+		t.Fatalf("creating account group: %v", err)
 	}
-	userID := types.UserID(user.ID)
-	if _, err := first.db.CreateAccount(db.CreateAccountParams{
+	account, err := first.db.CreateAccount(db.CreateAccountParams{
 		Username: "short-lease-user",
 		Password: "correct horse battery staple",
-		UserID:   &userID,
+		GroupID:  &group.ID,
 		Role:     types.AccountRoleUser,
 		Enabled:  true,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("creating account: %v", err)
 	}
 	shortExpiry := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
-	node := types.Node{UserID: &user.ID, RegisterMethod: "password", Expiry: &shortExpiry}
+	node := types.Node{UserID: account.UserID, RegisterMethod: "password", Expiry: &shortExpiry}
 	if err := first.db.DB.Create(&node).Error; err != nil {
 		t.Fatalf("creating node: %v", err)
 	}

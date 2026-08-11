@@ -38,11 +38,24 @@ CREATE UNIQUE INDEX idx_provider_identifier ON users(provider_identifier) WHERE 
 CREATE UNIQUE INDEX idx_name_provider_identifier ON users(name, provider_identifier);
 CREATE UNIQUE INDEX idx_name_no_provider_identifier ON users(name) WHERE provider_identifier IS NULL;
 
+CREATE TABLE account_groups(
+  id integer PRIMARY KEY AUTOINCREMENT,
+  name text NOT NULL,
+
+  created_at datetime,
+  updated_at datetime,
+  deleted_at datetime
+);
+CREATE INDEX idx_account_groups_deleted_at ON account_groups(deleted_at);
+CREATE UNIQUE INDEX idx_account_groups_name ON account_groups(name);
+CREATE UNIQUE INDEX idx_account_groups_name_lower ON account_groups(LOWER(name)) WHERE deleted_at IS NULL;
+
 CREATE TABLE accounts(
   id integer PRIMARY KEY AUTOINCREMENT,
   username text NOT NULL,
   password_hash text NOT NULL,
   user_id integer,
+  group_id integer,
   role text NOT NULL DEFAULT "user",
   enabled numeric NOT NULL DEFAULT true,
   expires_at datetime,
@@ -55,11 +68,13 @@ CREATE TABLE accounts(
   updated_at datetime,
   deleted_at datetime,
 
-  CONSTRAINT fk_accounts_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE
+  CONSTRAINT fk_accounts_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
+  CONSTRAINT fk_accounts_group FOREIGN KEY(group_id) REFERENCES account_groups(id) ON DELETE RESTRICT ON UPDATE CASCADE
 );
 CREATE INDEX idx_accounts_deleted_at ON accounts(deleted_at);
 CREATE UNIQUE INDEX idx_accounts_username ON accounts(username);
 CREATE UNIQUE INDEX idx_accounts_user_id ON accounts(user_id);
+CREATE INDEX idx_accounts_group_id ON accounts(group_id);
 
 CREATE TABLE account_sessions(
   id integer PRIMARY KEY AUTOINCREMENT,
@@ -146,7 +161,6 @@ CREATE TABLE nodes(
   CONSTRAINT fk_nodes_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
   CONSTRAINT fk_nodes_auth_key FOREIGN KEY(auth_key_id) REFERENCES pre_auth_keys(id)
 );
-
 CREATE TABLE policies(
   id integer PRIMARY KEY AUTOINCREMENT,
   data text,
@@ -162,7 +176,6 @@ CREATE TABLE database_versions(
   version text NOT NULL,
   updated_at datetime
 );
-
 CREATE TABLE runtime_settings(
   key text PRIMARY KEY,
   value text NOT NULL,

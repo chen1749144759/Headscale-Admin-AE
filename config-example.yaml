@@ -374,7 +374,6 @@ scaleforge:
   trust_proxy: false
   trusted_proxy_cidrs: []
   # Maximum nodes one account-owned network can register. Set 0 to disable.
-  max_nodes_per_account: 20
 
   # Required only when the accounts table is empty. The password file should
   # be supplied as a Docker/Kubernetes secret and is ignored after bootstrap.

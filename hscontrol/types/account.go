@@ -14,8 +14,9 @@ const (
 	AccountPasswordMaxAge = 90 * 24 * time.Hour
 )
 
-// Account is the single human identity used by both ScaleTail clients and
-// ScaleForge. User remains the Headscale network namespace that owns nodes.
+// Account is the single managed identity used by both ScaleTail clients and
+// ScaleForge. Each account owns one internal Headscale network identity and
+// belongs to an optional reusable business group.
 type Account struct {
 	gorm.Model //nolint:embeddedstructfieldcheck
 
@@ -28,6 +29,9 @@ type Account struct {
 	UserID *uint `gorm:"uniqueIndex"`
 	User   *User `gorm:"constraint:OnUpdate:CASCADE,OnDelete:SET NULL;"`
 
+	GroupID *uint         `gorm:"index"`
+	Group   *AccountGroup `gorm:"constraint:OnUpdate:CASCADE,OnDelete:RESTRICT;"`
+
 	Role               string `gorm:"size:32;not null;default:user"`
 	Enabled            bool   `gorm:"not null;default:true"`
 	ExpiresAt          *time.Time
@@ -35,6 +39,15 @@ type Account struct {
 	MustChangePassword bool      `gorm:"not null;default:false"`
 	PasswordVersion    uint64    `gorm:"not null;default:1"`
 	LastLoginAt        *time.Time
+}
+
+// AccountGroup classifies accounts for policy, traffic and administration.
+// It is deliberately separate from Headscale's User protocol identity so one
+// group can contain many independently authenticated ScaleTail users.
+type AccountGroup struct {
+	gorm.Model //nolint:embeddedstructfieldcheck
+
+	Name string `gorm:"size:255;not null;uniqueIndex"`
 }
 
 // AccountSession is an opaque ScaleForge browser session. Only a SHA-256 hash
