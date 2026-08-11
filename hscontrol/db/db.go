@@ -867,7 +867,6 @@ CREATE TABLE IF NOT EXISTS runtime_settings (
 		indexes := []string{
 			`CREATE INDEX idx_users_deleted_at ON users(deleted_at)`,
 			`CREATE INDEX idx_account_groups_deleted_at ON account_groups(deleted_at)`,
-			`CREATE UNIQUE INDEX idx_account_groups_name ON account_groups(name)`,
 			`CREATE UNIQUE INDEX idx_account_groups_name_lower ON account_groups(LOWER(name)) WHERE deleted_at IS NULL`,
 			`CREATE INDEX idx_accounts_deleted_at ON accounts(deleted_at)`,
 			`CREATE UNIQUE INDEX idx_accounts_username ON accounts(username)`,

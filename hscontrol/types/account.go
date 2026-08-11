@@ -47,7 +47,7 @@ type Account struct {
 type AccountGroup struct {
 	gorm.Model //nolint:embeddedstructfieldcheck
 
-	Name string `gorm:"size:255;not null;uniqueIndex"`
+	Name string `gorm:"size:255;not null"`
 }
 
 // AccountSession is an opaque ScaleForge browser session. Only a SHA-256 hash

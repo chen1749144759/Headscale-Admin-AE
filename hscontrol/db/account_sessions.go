@@ -110,6 +110,7 @@ func (hsdb *HSDatabase) ValidateAccountSession(
 	result := hsdb.DB.
 		Preload("Account").
 		Preload("Account.User").
+		Preload("Account.Group").
 		Where("token_hash = ? AND revoked_at IS NULL", tokenHash[:]).
 		First(&session)
 	if errors.Is(result.Error, gorm.ErrRecordNotFound) {

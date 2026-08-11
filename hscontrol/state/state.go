@@ -621,7 +621,8 @@ func (s *State) CreateAccount(params hsdb.CreateAccountParams) (*types.Account, 
 		return nil, err
 	}
 	if _, err := s.updatePolicyManagerUsers(); err != nil {
-		return account, fmt.Errorf("updating policy manager after account creation: %w", err)
+		log.Error().Err(err).Uint("account_id", account.ID).
+			Msg("account created, but policy manager refresh failed")
 	}
 
 	return account, nil

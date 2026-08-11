@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -26,6 +27,15 @@ func splitLegacyAccountNodes(tx *gorm.DB) error {
 		}
 		if len(nodes) <= 1 {
 			continue
+		}
+
+		groupID := account.GroupID
+		if groupID == nil {
+			legacyGroup, err := ensureLegacyAccountGroup(tx)
+			if err != nil {
+				return err
+			}
+			groupID = &legacyGroup.ID
 		}
 
 		sort.SliceStable(nodes, func(i, j int) bool {
@@ -66,7 +76,7 @@ func splitLegacyAccountNodes(tx *gorm.DB) error {
 				Username:           username,
 				PasswordHash:       account.PasswordHash,
 				UserID:             &networkUserID,
-				GroupID:            account.GroupID,
+				GroupID:            groupID,
 				Role:               types.AccountRoleUser,
 				Enabled:            false,
 				PasswordChangedAt:  now,
@@ -89,7 +99,31 @@ func splitLegacyAccountNodes(tx *gorm.DB) error {
 	return nil
 }
 
+func ensureLegacyAccountGroup(tx *gorm.DB) (*types.AccountGroup, error) {
+	const legacyGroupName = "Legacy"
+
+	var group types.AccountGroup
+	result := tx.Where("LOWER(name) = LOWER(?)", legacyGroupName).First(&group)
+	if result.Error == nil {
+		return &group, nil
+	}
+	if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		return nil, fmt.Errorf("finding legacy account group: %w", result.Error)
+	}
+
+	group.Name = legacyGroupName
+	if err := tx.Create(&group).Error; err != nil {
+		return nil, fmt.Errorf("creating legacy account group: %w", err)
+	}
+
+	return &group, nil
+}
+
 func migrateAccountGroups(tx *gorm.DB) error {
+	return tx.Transaction(migrateAccountGroupsInTransaction)
+}
+
+func migrateAccountGroupsInTransaction(tx *gorm.DB) error {
 	if tx.Dialector.Name() == "sqlite" {
 		statements := []string{
 			`CREATE TABLE IF NOT EXISTS account_groups (
@@ -99,7 +133,7 @@ created_at datetime,
 updated_at datetime,
 deleted_at datetime
 )`,
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_groups_name ON account_groups(name)`,
+			`DROP INDEX IF EXISTS idx_account_groups_name`,
 			`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_groups_name_lower ON account_groups(LOWER(name)) WHERE deleted_at IS NULL`,
 			`CREATE INDEX IF NOT EXISTS idx_account_groups_deleted_at ON account_groups(deleted_at)`,
 		}
@@ -135,7 +169,7 @@ UPDATE accounts
 SET group_id = (
     SELECT g.id
     FROM users u
-    JOIN account_groups g ON g.name = u.name AND g.deleted_at IS NULL
+    JOIN account_groups g ON LOWER(g.name) = LOWER(u.name) AND g.deleted_at IS NULL
     WHERE u.id = accounts.user_id
     LIMIT 1
 ), updated_at = CURRENT_TIMESTAMP
@@ -144,7 +178,7 @@ WHERE role = 'user'
   AND EXISTS (
       SELECT 1
       FROM users u
-      JOIN account_groups g ON g.name = u.name AND g.deleted_at IS NULL
+      JOIN account_groups g ON LOWER(g.name) = LOWER(u.name) AND g.deleted_at IS NULL
       WHERE u.id = accounts.user_id
   )`).Error; err != nil {
 			return fmt.Errorf("assigning legacy account groups: %w", err)
@@ -161,7 +195,7 @@ created_at timestamptz,
 updated_at timestamptz,
 deleted_at timestamptz
 )`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_groups_name ON account_groups(name)`,
+		`DROP INDEX IF EXISTS idx_account_groups_name`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_groups_name_lower ON account_groups(LOWER(name)) WHERE deleted_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_account_groups_deleted_at ON account_groups(deleted_at)`,
 		`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS group_id bigint`,
@@ -180,7 +214,7 @@ BEGIN
     END IF;
 END $$`,
 		`INSERT INTO account_groups (id, name, created_at, updated_at)
-SELECT u.id, u.name, NOW(), NOW()
+SELECT DISTINCT ON (LOWER(u.name)) u.id, u.name, NOW(), NOW()
 FROM users u
 WHERE u.deleted_at IS NULL
   AND COALESCE(BTRIM(u.name), '') <> ''
@@ -189,8 +223,9 @@ WHERE u.deleted_at IS NULL
       WHERE manager.user_id = u.id
         AND manager.role = 'manager'
         AND manager.deleted_at IS NULL
-  )
-ON CONFLICT (name) DO NOTHING`,
+   )
+ORDER BY LOWER(u.name), u.id
+ON CONFLICT DO NOTHING`,
 		`SELECT setval(
     pg_get_serial_sequence('account_groups', 'id'),
     GREATEST(COALESCE((SELECT MAX(id) FROM account_groups), 1), 1),
@@ -199,10 +234,22 @@ ON CONFLICT (name) DO NOTHING`,
 		`UPDATE accounts a
 SET group_id = g.id, updated_at = NOW()
 FROM users u
-JOIN account_groups g ON g.name = u.name AND g.deleted_at IS NULL
+JOIN account_groups g ON LOWER(g.name) = LOWER(u.name) AND g.deleted_at IS NULL
 WHERE a.user_id = u.id
   AND a.role = 'user'
   AND a.group_id IS NULL`,
+	}
+
+	for _, statement := range statements {
+		if err := tx.Exec(statement).Error; err != nil {
+			return fmt.Errorf("migrating account groups: %w", err)
+		}
+	}
+	if err := splitLegacyAccountNodes(tx); err != nil {
+		return err
+	}
+
+	constraints := []string{
 		`DO $$
 BEGIN
     IF NOT EXISTS (
@@ -222,13 +269,10 @@ END $$`,
 		`ALTER TABLE accounts VALIDATE CONSTRAINT ck_accounts_user_identity_group`,
 	}
 
-	for _, statement := range statements {
+	for _, statement := range constraints {
 		if err := tx.Exec(statement).Error; err != nil {
-			return fmt.Errorf("migrating account groups: %w", err)
+			return fmt.Errorf("validating account groups: %w", err)
 		}
-	}
-	if err := splitLegacyAccountNodes(tx); err != nil {
-		return err
 	}
 
 	return nil

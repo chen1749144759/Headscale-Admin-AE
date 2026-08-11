@@ -47,7 +47,6 @@ CREATE TABLE account_groups(
   deleted_at datetime
 );
 CREATE INDEX idx_account_groups_deleted_at ON account_groups(deleted_at);
-CREATE UNIQUE INDEX idx_account_groups_name ON account_groups(name);
 CREATE UNIQUE INDEX idx_account_groups_name_lower ON account_groups(LOWER(name)) WHERE deleted_at IS NULL;
 
 CREATE TABLE accounts(
