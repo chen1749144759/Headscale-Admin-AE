@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -574,8 +575,8 @@ func validateServerConfig() error {
 	}
 
 	serverURL := strings.TrimSpace(viper.GetString("server_url"))
-	if !AccountPasswordServerURLIsTrusted(serverURL) {
-		errorText += "Fatal config error: server_url must be an origin-only HTTPS URL (HTTP is allowed only for localhost or loopback IPs)\n"
+	if !AccountPasswordServerURLIsValid(serverURL) {
+		errorText += "Fatal config error: server_url must be an origin-only HTTP or HTTPS URL\n"
 	}
 	if viper.GetBool("scaleforge.trust_proxy") {
 		trustedProxyCIDRs, err := configuredTrustedProxyCIDRs()
@@ -656,29 +657,27 @@ func validateServerConfig() error {
 	return nil
 }
 
-// AccountPasswordServerURLIsTrusted validates the exact origin used by both
-// startup checks and the runtime password endpoint.
-func AccountPasswordServerURLIsTrusted(rawURL string) bool {
+// AccountPasswordServerURLIsValid reports whether rawURL is an origin-only
+// HTTP or HTTPS URL suitable for the control server.
+func AccountPasswordServerURLIsValid(rawURL string) bool {
 	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" ||
-		parsed.ForceQuery || parsed.Fragment != "" ||
-		(parsed.Path != "" && parsed.Path != "/") {
+	if err != nil || parsed.Host == "" || strings.Trim(strings.TrimSpace(parsed.Hostname()), ".") == "" ||
+		parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawPath != "" ||
+		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
 		return false
 	}
-	if strings.EqualFold(parsed.Scheme, "https") {
-		return true
-	}
-	if !strings.EqualFold(parsed.Scheme, "http") {
+	if strings.HasSuffix(parsed.Host, ":") {
 		return false
 	}
-
-	host := strings.TrimSpace(parsed.Hostname())
-	if strings.EqualFold(host, "localhost") {
-		return true
+	if port := parsed.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return false
+		}
 	}
-	address, err := netip.ParseAddr(host)
 
-	return err == nil && address.IsLoopback()
+	return strings.EqualFold(parsed.Scheme, "http") ||
+		strings.EqualFold(parsed.Scheme, "https")
 }
 
 func configuredTrustedProxyCIDRs() ([]netip.Prefix, error) {

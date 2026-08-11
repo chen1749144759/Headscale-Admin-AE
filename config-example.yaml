@@ -5,10 +5,14 @@
 # - `~/.headscale`
 # - current working directory
 
-# The url clients will connect to.
-# Typically this will be a domain like:
+# The origin-only HTTP or HTTPS URL clients will connect to. Userinfo, paths,
+# queries and fragments are not allowed. Account credentials are sent only
+# inside TS2021 Noise; HTTP deployments must pin the Noise server public key or
+# retain it via TOFU and reject unexpected changes before sending credentials.
+# Examples:
 #
 # https://myheadscale.example.com:443
+# http://192.0.2.10:8080
 #
 server_url: http://127.0.0.1:8080
 
@@ -28,7 +32,8 @@ metrics_listen_addr: 127.0.0.1:9090
 noise:
   # The Noise private key is used to encrypt the traffic between headscale and
   # Tailscale clients when using the new Noise-based protocol. A missing key
-  # will be automatically generated.
+  # will be automatically generated. Keep this key persistent: HTTP clients
+  # rely on pinning it or remembering it via TOFU to authenticate the server.
   private_key_path: /var/lib/headscale/noise_private.key
 
 # List of IP prefixes to allocate tailaddresses from.
@@ -69,7 +74,7 @@ prefixes:
 derp:
   server:
     # If enabled, runs the embedded DERP server and merges it into the rest of the DERP config
-    # The Headscale server_url defined above MUST be using https, DERP requires TLS to be in place
+    # Embedded DERP still requires TLS even when the control server_url uses HTTP.
     enabled: false
 
     # Region ID to use for the embedded DERP server.

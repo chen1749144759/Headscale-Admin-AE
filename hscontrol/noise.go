@@ -569,10 +569,6 @@ func writePasswordAuthResponse(
 	}
 }
 
-func passwordAuthServerURLIsTrusted(serverURL string) bool {
-	return types.AccountPasswordServerURLIsTrusted(serverURL)
-}
-
 func trustedProxyAddress(address netip.Addr, prefixes []netip.Prefix) bool {
 	address = address.Unmap()
 	for _, prefix := range prefixes {
@@ -610,17 +606,13 @@ func noiseAuthSource(req *http.Request, trustedProxyCIDRs []netip.Prefix) string
 }
 
 // PasswordAuthHandler authenticates a pending registration using the single
-// account credential. It is only reachable inside the machine's Noise session;
-// the auth ID is additionally bound to that session's machine key.
+// account credential. This endpoint exists only inside the encrypted TS2021
+// Noise session and is never registered on the outer HTTP router. The outer
+// control URL may therefore use HTTP or HTTPS. With HTTP, credential security
+// depends on the client pinning the Noise server public key or recording it via
+// TOFU and refusing unexpected key changes before credentials are sent. The
+// auth ID is additionally bound to this Noise session's machine key.
 func (ns *noiseServer) PasswordAuthHandler(writer http.ResponseWriter, req *http.Request) {
-	if !passwordAuthServerURLIsTrusted(ns.headscale.cfg.ServerURL) {
-		writePasswordAuthResponse(writer, http.StatusUpgradeRequired, passwordAuthResponse{
-			Code:  "https_required",
-			Error: "password authentication requires a trusted HTTPS control server",
-		})
-		return
-	}
-
 	req.Body = http.MaxBytesReader(writer, req.Body, passwordAuthRequestBodyLimit)
 	decoder := json.NewDecoder(req.Body)
 	decoder.DisallowUnknownFields()

@@ -20,13 +20,13 @@ Headscale-Admin-AE 是服务于 ScaleTail 和 ScaleForge 的自托管控制面�
 - 密码最长有效期固定为 90 天；到期后只能先修改密码，再恢复管理操作和节点登录。
 - 新密码不能复用当前密码和最近四个历史密码；管理员重置会要求账户下次登录立即修改临时密码。
 - 修改或重置密码会提升密码版本、撤销旧管理会话，并使节点重新完成账户证明。
-- 新的 ScaleTail 控制会话必须在加密的 Noise 会话内提交账户证明，密码不会作为节点长期密钥保存到服务端。
+- 新的 ScaleTail 控制会话必须在加密的 Noise 会话内提交账户证明，密码不会作为节点长期密钥保存到服务端。外层控制地址可以使用 HTTP 或 HTTPS；HTTP 部署要求客户端通过 TOFU 记录或显式 pin Noise 服务端公钥，并在公钥异常变化时拒绝发送凭据。
 - 账户可单独禁用、设置账户到期时间、绑定网络并限制可注册节点数量。
 - 账户认证节点的有效期不会超过“密码修改时间 + 90 天”或账户到期时间中的较早值。
 
 ```text
 ScaleTail
-  | HTTPS + TS2021 Noise + account proof
+  | HTTP(S) + TS2021 Noise + account proof
   v
 Headscale-Admin-AE
   | private Unix socket
@@ -106,7 +106,7 @@ derp:
   auto_update_enabled: false
 ```
 
-- `server_url` 必须使用客户端信任的 HTTPS 证书，DERP 域名和端口必须可从公网访问。
+- 控制面的 `server_url` 可以使用 HTTP 或 HTTPS；内置 DERP 仍需提供 TLS，且 DERP 域名和端口必须可从公网访问。
 - `verify_clients: true` 只允许本控制面的有效节点使用中继。
 - `urls: []` 和 `auto_update_enabled: false` 表示不混入公共 DERP map。
 - DERP 私钥必须持久化，并且不能与 Noise 私钥共用。
@@ -134,10 +134,10 @@ go build -trimpath -o headscale ./cmd/headscale
 
 启动前至少确认：
 
-- `server_url` 与 ScaleTail 填写的 HTTPS 控制地址一致。
+- `server_url` 与 ScaleTail 填写的 HTTP 或 HTTPS 控制地址一致；使用 HTTP 时必须启用客户端 Noise 公钥 TOFU/pin 校验。
 - 三个 Unix socket 路径不同，且只挂载给对应容器。
 - Bootstrap 密码与内部 HMAC 密钥来自不同的 secret 文件，且均未写入配置或镜像。
-- 可信代理 CIDR 只包含实际 TLS 反向代理网络。
+- 可信代理 CIDR 只包含实际反向代理网络。
 - 数据库迁移日志无错误。
 - 内置 DERP 的域名、证书、TCP 端口和 `UDP/3478` 可达。
 - 旧节点已使用新版 ScaleTail 完成账户重新登录。

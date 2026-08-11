@@ -11,26 +11,6 @@ import (
 	"tailscale.com/types/key"
 )
 
-func TestPasswordAuthServerURLIsTrusted(t *testing.T) {
-	tests := map[string]bool{
-		"https://control.example.com":             true,
-		"http://localhost:8080":                   true,
-		"http://127.0.0.1:8080":                   true,
-		"http://[::1]:8080":                       true,
-		"http://192.0.2.10:8080":                  false,
-		"https://user:pass@control.example.com":   false,
-		"https://control.example.com/control":     false,
-		"https://control.example.com/?redirect=x": false,
-		"not-a-url": false,
-	}
-
-	for serverURL, want := range tests {
-		if got := passwordAuthServerURLIsTrusted(serverURL); got != want {
-			t.Errorf("passwordAuthServerURLIsTrusted(%q) = %v, want %v", serverURL, got, want)
-		}
-	}
-}
-
 func TestNoiseAccountProofIsScopedToNodeAndSession(t *testing.T) {
 	t.Parallel()
 
