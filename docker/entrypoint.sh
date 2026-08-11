@@ -39,6 +39,9 @@ do
 done
 
 install -d -m 0750 -o headscale -g headscale /var/lib/headscale "$(dirname "$config_output")"
+# Older images wrote persisted keys as root. Normalize the mounted state volume
+# before dropping privileges so in-place upgrades retain the same Noise identity.
+chown -R headscale:headscale /var/lib/headscale
 install -d -m 0770 -o headscale -g headscale /var/run/headscale
 install -d -m 2750 -o headscale -g scaleforge /var/run/scaleforge/control
 install -d -m 2750 -o headscale -g scaleforge /var/run/scaleforge/client
