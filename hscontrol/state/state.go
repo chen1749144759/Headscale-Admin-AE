@@ -744,6 +744,44 @@ func (s *State) ChangeAccountPassword(
 	}, now)
 }
 
+// ChangeAuthenticatedAccountPassword changes a password only if the account
+// version authenticated by the caller is still current. Password expiry is
+// intentionally allowed; disabled and expired accounts are not.
+func (s *State) ChangeAuthenticatedAccountPassword(
+	accountID uint,
+	passwordVersion uint64,
+	newPassword string,
+	now time.Time,
+) ([]change.Change, error) {
+	unlock := s.accountOperationLocks.lock(accountID)
+	defer unlock()
+
+	account, err := s.db.GetAccountByID(accountID)
+	if err != nil {
+		return nil, err
+	}
+	if account.PasswordVersion != passwordVersion {
+		return nil, hsdb.ErrAccountConcurrentUpdate
+	}
+	if !account.Enabled {
+		return nil, hsdb.ErrAccountDisabled
+	}
+	if account.ExpiresAt != nil && !account.ExpiresAt.After(now) {
+		return nil, hsdb.ErrAccountExpired
+	}
+	if err := s.db.ChangeAccountPassword(accountID, newPassword, now); err != nil {
+		return nil, err
+	}
+	updated, err := s.db.GetAccountByID(accountID)
+	if err != nil {
+		return nil, err
+	}
+	if updated.UserID == nil {
+		return nil, nil
+	}
+	return s.reconcileAccountNodes(updated.UserID, now, now)
+}
+
 func (s *State) ResetAccountPassword(
 	accountID uint,
 	newPassword string,

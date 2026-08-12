@@ -167,6 +167,7 @@ func (h *Headscale) NoiseUpgradeHandler(
 	r.Route("/machine", func(r chi.Router) {
 		r.Post("/register", ns.RegistrationHandler)
 		r.Post("/auth/password", ns.PasswordAuthHandler)
+		r.Put("/auth/password", ns.PasswordChangeHandler)
 		r.Post("/map", ns.PollNetMapHandler)
 		r.Get("/scaleforge/client-update", ns.ScaleForgeClientHandler)
 		r.Post("/scaleforge/traffic", ns.ScaleForgeClientHandler)
@@ -547,6 +548,13 @@ type passwordAuthRequest struct {
 	Password string `json:"password"`
 }
 
+type passwordChangeRequest struct {
+	AuthID          string `json:"authId"`
+	Username        string `json:"username"`
+	CurrentPassword string `json:"currentPassword"`
+	NewPassword     string `json:"newPassword"`
+}
+
 type passwordAuthResponse struct {
 	Status  string `json:"status,omitempty"`
 	Code    string `json:"code,omitempty"`
@@ -761,6 +769,119 @@ func (ns *noiseServer) PasswordAuthHandler(writer http.ResponseWriter, req *http
 	ns.headscale.Change(nodeChange, routesChange)
 	ns.rememberAccountProof(account, node.NodeKey(), types.UserID(*account.UserID))
 	writePasswordAuthResponse(writer, http.StatusOK, passwordAuthResponse{Status: "authenticated"})
+}
+
+// PasswordChangeHandler replaces an expired temporary or 90-day password
+// inside the encrypted Noise session. It is limited to the pending
+// registration (or the account's existing password-authenticated node), so
+// possession of an account password alone is not enough to use this endpoint
+// from an unrelated machine session.
+func (ns *noiseServer) PasswordChangeHandler(writer http.ResponseWriter, req *http.Request) {
+	req.Body = http.MaxBytesReader(writer, req.Body, passwordAuthRequestBodyLimit)
+	decoder := json.NewDecoder(req.Body)
+	decoder.DisallowUnknownFields()
+	var changeReq passwordChangeRequest
+	if err := decoder.Decode(&changeReq); err != nil {
+		writePasswordAuthResponse(writer, http.StatusBadRequest, passwordAuthResponse{
+			Code: "invalid_request", Error: "invalid password change request",
+		})
+		return
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		writePasswordAuthResponse(writer, http.StatusBadRequest, passwordAuthResponse{
+			Code: "invalid_request", Error: "password change request must contain one JSON value",
+		})
+		return
+	}
+
+	changeReq.Username = strings.TrimSpace(changeReq.Username)
+	if changeReq.Username == "" || changeReq.CurrentPassword == "" ||
+		len(changeReq.Username) > 255 || len([]byte(changeReq.CurrentPassword)) > 72 {
+		writePasswordAuthResponse(writer, http.StatusBadRequest, passwordAuthResponse{
+			Code: "invalid_request", Error: "invalid username or current password length",
+		})
+		return
+	}
+	if err := hsdb.ValidateAccountPassword(changeReq.NewPassword); err != nil {
+		writePasswordAuthResponse(writer, http.StatusBadRequest, passwordAuthResponse{
+			Code: "invalid_password", Error: err.Error(),
+		})
+		return
+	}
+
+	now := time.Now().UTC()
+	account, err := ns.authenticateAccount(
+		req.Context(),
+		changeReq.Username,
+		changeReq.CurrentPassword,
+		now,
+	)
+	if !errors.Is(err, hsdb.ErrAccountPasswordExpired) || account == nil {
+		if err == nil {
+			writePasswordAuthResponse(writer, http.StatusConflict, passwordAuthResponse{
+				Code: "password_not_expired", Error: "password change is not required",
+			})
+			return
+		}
+		status, code, message := passwordAuthFailure(err)
+		writePasswordAuthResponse(writer, status, passwordAuthResponse{Code: code, Error: message})
+		return
+	}
+	if account.UserID == nil || !ns.passwordChangeSessionMatchesAccount(changeReq.AuthID, account) {
+		writePasswordAuthResponse(writer, http.StatusUnauthorized, passwordAuthResponse{
+			Code: "machine_mismatch", Error: "password change session does not belong to this account",
+		})
+		return
+	}
+
+	changes, err := ns.headscale.state.ChangeAuthenticatedAccountPassword(
+		account.ID,
+		account.PasswordVersion,
+		changeReq.NewPassword,
+		now,
+	)
+	if err != nil {
+		status, code, message := http.StatusBadRequest, "invalid_password", err.Error()
+		switch {
+		case errors.Is(err, hsdb.ErrAccountPasswordReused):
+			code, message = "password_reused", "new password must not match a recent password"
+		case errors.Is(err, hsdb.ErrAccountConcurrentUpdate):
+			status, code, message = http.StatusConflict, "account_changed", "account changed during password update; retry"
+		case errors.Is(err, hsdb.ErrAccountDisabled):
+			status, code, message = http.StatusForbidden, "account_disabled", "account is disabled"
+		case errors.Is(err, hsdb.ErrAccountExpired):
+			status, code, message = http.StatusForbidden, "account_expired", "account is expired"
+		}
+		writePasswordAuthResponse(writer, status, passwordAuthResponse{Code: code, Error: message})
+		return
+	}
+
+	if len(changes) > 0 {
+		ns.headscale.Change(changes...)
+	}
+	writer.Header().Set("Cache-Control", "no-store")
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (ns *noiseServer) passwordChangeSessionMatchesAccount(authIDRaw string, account *types.Account) bool {
+	if account == nil || account.UserID == nil {
+		return false
+	}
+	if authIDRaw == "" {
+		node, ok := ns.headscale.state.GetNodeByMachineKey(ns.machineKey, types.UserID(*account.UserID))
+		return ok && !node.IsTagged() && node.RegisterMethod() == util.RegisterMethodPassword
+	}
+	authID, err := types.AuthIDFromString(authIDRaw)
+	if err != nil {
+		return false
+	}
+	entry, ok := ns.headscale.state.GetAuthCacheEntry(authID)
+	if !ok {
+		return false
+	}
+	regData, ok := entry.RegistrationDataOK()
+	return ok && regData.MachineKey == ns.machineKey &&
+		(regData.Hostinfo == nil || len(regData.Hostinfo.RequestTags) == 0)
 }
 
 func accountNodeExpiry(account *types.Account) time.Time {

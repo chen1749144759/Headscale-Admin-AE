@@ -1,15 +1,96 @@
 package hscontrol
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"testing"
 	"time"
 
+	hsdb "github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"gorm.io/gorm"
 	"tailscale.com/types/key"
 )
+
+func TestPasswordChangeHandlerCompletesTemporaryPasswordRotation(t *testing.T) {
+	app := newScaleForgeAPITestHeadscale(t)
+	account, err := app.state.CreateAccount(hsdb.CreateAccountParams{
+		Username:              "noise-temporary-user",
+		Password:              "temporary correct password",
+		Role:                  types.AccountRoleManager,
+		Enabled:               true,
+		RequirePasswordChange: true,
+	})
+	if err != nil {
+		t.Fatalf("creating temporary account: %v", err)
+	}
+
+	machineKey := key.NewMachine().Public()
+	authID := types.MustAuthID()
+	app.state.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: machineKey,
+		NodeKey:    key.NewNode().Public(),
+		DiscoKey:   key.NewDisco().Public(),
+		Hostname:   "first-login-client",
+	}))
+	ns := &noiseServer{
+		headscale:  app,
+		machineKey: machineKey,
+		authSource: "192.0.2.44",
+	}
+	body := fmt.Sprintf(`{
+		"authId":%q,
+		"username":"noise-temporary-user",
+		"currentPassword":"temporary correct password",
+		"newPassword":"new correct horse password"
+	}`, authID.String())
+	req := httptest.NewRequest(http.MethodPut, "https://unused/machine/auth/password", bytes.NewBufferString(body))
+	res := httptest.NewRecorder()
+	ns.PasswordChangeHandler(res, req)
+	if res.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body = %s", res.Code, http.StatusNoContent, res.Body.String())
+	}
+
+	if _, err := app.state.AuthenticateAccount(
+		account.Username,
+		"temporary correct password",
+		time.Now().UTC(),
+	); !errors.Is(err, hsdb.ErrAccountInvalidCredentials) {
+		t.Fatalf("temporary password error = %v, want %v", err, hsdb.ErrAccountInvalidCredentials)
+	}
+	updated, err := app.state.AuthenticateAccount(
+		account.Username,
+		"new correct horse password",
+		time.Now().UTC(),
+	)
+	if err != nil || updated.MustChangePassword {
+		t.Fatalf("new password authentication = account %+v, err %v", updated, err)
+	}
+}
+
+func TestPasswordChangeHandlerRejectsInvalidNewPassword(t *testing.T) {
+	t.Parallel()
+
+	ns := &noiseServer{}
+	req := httptest.NewRequest(http.MethodPut, "https://unused/machine/auth/password", bytes.NewBufferString(`{
+		"authId":"hskey-authreq-AbCdEfGhIjKlMnOpQrStUvWx",
+		"username":"alice",
+		"currentPassword":"temporary correct password",
+		"newPassword":"short"
+	}`))
+	res := httptest.NewRecorder()
+	ns.PasswordChangeHandler(res, req)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body = %s", res.Code, http.StatusBadRequest, res.Body.String())
+	}
+	if got := res.Body.String(); !bytes.Contains([]byte(got), []byte(`"code":"invalid_password"`)) {
+		t.Fatalf("response = %s, want invalid_password", got)
+	}
+}
 
 func TestNoiseAccountProofIsScopedToNodeAndSession(t *testing.T) {
 	t.Parallel()

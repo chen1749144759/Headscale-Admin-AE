@@ -172,3 +172,54 @@ func TestBeginAccountAuthenticationRejectsOldPasswordVersion(t *testing.T) {
 		t.Fatalf("old authentication snapshot error = %v, want %v", err, db.ErrAccountConcurrentUpdate)
 	}
 }
+
+func TestChangeAuthenticatedAccountPasswordRejectsStaleVersion(t *testing.T) {
+	config := newAccountStartupTestConfig(t)
+	appState, err := NewState(config)
+	if err != nil {
+		t.Fatalf("creating state: %v", err)
+	}
+	t.Cleanup(func() { _ = appState.Close() })
+	account, err := appState.CreateAccount(db.CreateAccountParams{
+		Username:              "temporary-manager",
+		Password:              "temporary correct password",
+		Role:                  types.AccountRoleManager,
+		Enabled:               true,
+		RequirePasswordChange: true,
+	})
+	if err != nil {
+		t.Fatalf("creating account: %v", err)
+	}
+	authenticated, err := appState.AuthenticateAccount(
+		account.Username,
+		"temporary correct password",
+		time.Now().UTC(),
+	)
+	if !errors.Is(err, db.ErrAccountPasswordExpired) || authenticated == nil {
+		t.Fatalf("temporary password authentication = account %+v, err %v", authenticated, err)
+	}
+	if _, err := appState.ChangeAuthenticatedAccountPassword(
+		authenticated.ID,
+		authenticated.PasswordVersion,
+		"new correct horse password",
+		time.Now().UTC(),
+	); err != nil {
+		t.Fatalf("changing authenticated password: %v", err)
+	}
+	if _, err := appState.ChangeAuthenticatedAccountPassword(
+		authenticated.ID,
+		authenticated.PasswordVersion,
+		"another correct password",
+		time.Now().UTC(),
+	); !errors.Is(err, db.ErrAccountConcurrentUpdate) {
+		t.Fatalf("stale password version error = %v, want %v", err, db.ErrAccountConcurrentUpdate)
+	}
+	updated, err := appState.AuthenticateAccount(
+		account.Username,
+		"new correct horse password",
+		time.Now().UTC(),
+	)
+	if err != nil || updated.MustChangePassword {
+		t.Fatalf("new password authentication = account %+v, err %v", updated, err)
+	}
+}
