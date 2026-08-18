@@ -1974,6 +1974,7 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 
 	// Update existing node in NodeStore - validation passed, safe to mutate
 	updatedNodeView, ok := s.nodeStore.UpdateNode(params.ExistingNode.ID(), func(node *types.Node) {
+		node.MachineKey = regData.MachineKey
 		node.NodeKey = regData.NodeKey
 		node.DiscoKey = regData.DiscoKey
 		node.Hostname = params.Hostname
@@ -2427,10 +2428,25 @@ func (s *State) HandleNodeFromAuthPath(
 	if existingNodeIsTagged && (nodeExistsForSameUser || existingNodeOwnedByOtherUser) {
 		return types.NodeView{}, change.Change{}, ErrAmbiguousNodeOwnership
 	}
-	createsNewNode := !nodeExistsForSameUser && !existingNodeIsTagged
-	if registrationMethod == util.RegisterMethodPassword && createsNewNode &&
-		s.ListNodesByUser(userID).Len() >= 1 {
-		return types.NodeView{}, change.Change{}, ErrAccountNodeLimitReached
+	accountTakeover := false
+	if registrationMethod == util.RegisterMethodPassword &&
+		!nodeExistsForSameUser && !existingNodeIsTagged {
+		accountNodes := s.ListNodesByUser(userID)
+		if accountNodes.Len() > 0 {
+			// Password accounts represent one logical machine. Reuse the newest
+			// node record when a different machine key signs in so the login
+			// atomically replaces the old cryptographic identity while retaining
+			// the node ID, allocated IPs, approved routes, and policy references.
+			existingNodeSameUser = accountNodes.At(0)
+			for idx := 1; idx < accountNodes.Len(); idx++ {
+				candidate := accountNodes.At(idx)
+				if candidate.ID() > existingNodeSameUser.ID() {
+					existingNodeSameUser = candidate
+				}
+			}
+			nodeExistsForSameUser = true
+			accountTakeover = existingNodeSameUser.MachineKey() != machineKey
+		}
 	}
 
 	// Create logger with common fields for all auth operations
@@ -2439,6 +2455,12 @@ func (s *State) HandleNodeFromAuthPath(
 		Str(zf.MachineKey, machineKey.ShortString()).
 		Str(zf.Method, registrationMethod).
 		Logger()
+	if accountTakeover {
+		logger.Info().
+			Uint64(zf.ExistingNodeID, existingNodeSameUser.ID().Uint64()).
+			Str("old.machine_key", existingNodeSameUser.MachineKey().ShortString()).
+			Msg("Replacing existing password account node for single sign-on")
+	}
 
 	// Common params for update operations
 	updateParams := authNodeUpdateParams{
