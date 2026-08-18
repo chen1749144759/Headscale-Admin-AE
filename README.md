@@ -17,7 +17,7 @@ Headscale-Admin-AE 是服务于 ScaleTail 和 ScaleForge 的自托管控制面�
 
 - ScaleForge 管理后台和 ScaleTail 节点使用同一账户身份。
 - 密码使用 bcrypt 保存，长度必须为 12 至 72 字节。
-- 密码最长有效期固定为 90 天；管理员发放的一次性初始密码和到期密码可由新版 ScaleTail Windows 客户端在 Noise 加密通道内直接更新，无需普通用户访问 ScaleForge。
+- 密码最长有效期固定为 90 天；匹配当前机器注册或节点会话的 ScaleTail 客户端可在 Noise 加密通道内主动换密。Windows 处理首次/到期改密，Linux 托管节点会在到期前自动轮换，无需普通用户访问 ScaleForge。
 - 新密码不能复用当前密码和最近四个历史密码；管理员重置会要求账户下次登录立即修改临时密码。
 - 修改或重置密码会提升密码版本、撤销旧管理会话，并使节点重新完成账户证明。
 - 新的 ScaleTail 控制会话必须在加密的 Noise 会话内提交账户证明，密码不会作为节点长期密钥保存到服务端。外层控制地址可以使用 HTTP 或 HTTPS；HTTP 部署要求客户端通过 TOFU 记录或显式 pin Noise 服务端公钥，并在公钥异常变化时拒绝发送凭据。

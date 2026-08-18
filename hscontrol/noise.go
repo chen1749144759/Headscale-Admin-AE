@@ -771,8 +771,8 @@ func (ns *noiseServer) PasswordAuthHandler(writer http.ResponseWriter, req *http
 	writePasswordAuthResponse(writer, http.StatusOK, passwordAuthResponse{Status: "authenticated"})
 }
 
-// PasswordChangeHandler replaces an expired temporary or 90-day password
-// inside the encrypted Noise session. It is limited to the pending
+// PasswordChangeHandler replaces an account password inside the encrypted
+// Noise session. It is limited to the pending
 // registration (or the account's existing password-authenticated node), so
 // possession of an account password alone is not enough to use this endpoint
 // from an unrelated machine session.
@@ -816,15 +816,15 @@ func (ns *noiseServer) PasswordChangeHandler(writer http.ResponseWriter, req *ht
 		changeReq.CurrentPassword,
 		now,
 	)
-	if !errors.Is(err, hsdb.ErrAccountPasswordExpired) || account == nil {
-		if err == nil {
-			writePasswordAuthResponse(writer, http.StatusConflict, passwordAuthResponse{
-				Code: "password_not_expired", Error: "password change is not required",
-			})
-			return
-		}
+	if err != nil && !errors.Is(err, hsdb.ErrAccountPasswordExpired) {
 		status, code, message := passwordAuthFailure(err)
 		writePasswordAuthResponse(writer, status, passwordAuthResponse{Code: code, Error: message})
+		return
+	}
+	if account == nil {
+		writePasswordAuthResponse(writer, http.StatusUnauthorized, passwordAuthResponse{
+			Code: "invalid_credentials", Error: "invalid username or password",
+		})
 		return
 	}
 	if account.UserID == nil || !ns.passwordChangeSessionMatchesAccount(changeReq.AuthID, account) {

@@ -72,6 +72,60 @@ func TestPasswordChangeHandlerCompletesTemporaryPasswordRotation(t *testing.T) {
 	}
 }
 
+func TestPasswordChangeHandlerRotatesValidPasswordProactively(t *testing.T) {
+	app := newScaleForgeAPITestHeadscale(t)
+	account, err := app.state.CreateAccount(hsdb.CreateAccountParams{
+		Username: "noise-managed-user",
+		Password: "current correct password",
+		Role:     types.AccountRoleManager,
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("creating managed account: %v", err)
+	}
+
+	machineKey := key.NewMachine().Public()
+	authID := types.MustAuthID()
+	app.state.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: machineKey,
+		NodeKey:    key.NewNode().Public(),
+		DiscoKey:   key.NewDisco().Public(),
+		Hostname:   "managed-linux-client",
+	}))
+	ns := &noiseServer{
+		headscale:  app,
+		machineKey: machineKey,
+		authSource: "192.0.2.45",
+	}
+	body := fmt.Sprintf(`{
+		"authId":%q,
+		"username":"noise-managed-user",
+		"currentPassword":"current correct password",
+		"newPassword":"proactively rotated password"
+	}`, authID.String())
+	req := httptest.NewRequest(http.MethodPut, "https://unused/machine/auth/password", bytes.NewBufferString(body))
+	res := httptest.NewRecorder()
+	ns.PasswordChangeHandler(res, req)
+	if res.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body = %s", res.Code, http.StatusNoContent, res.Body.String())
+	}
+
+	if _, err := app.state.AuthenticateAccount(
+		account.Username,
+		"current correct password",
+		time.Now().UTC(),
+	); !errors.Is(err, hsdb.ErrAccountInvalidCredentials) {
+		t.Fatalf("old password error = %v, want %v", err, hsdb.ErrAccountInvalidCredentials)
+	}
+	if _, err := app.state.AuthenticateAccount(
+		account.Username,
+		"proactively rotated password",
+		time.Now().UTC(),
+	); err != nil {
+		t.Fatalf("rotated password authentication: %v", err)
+	}
+}
+
 func TestPasswordChangeHandlerRejectsInvalidNewPassword(t *testing.T) {
 	t.Parallel()
 
